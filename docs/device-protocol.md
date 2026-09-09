@@ -53,10 +53,15 @@ GET /device/commands
 |---|---|---|
 | `sync_character` | 更新角色与音色配置 | `character` |
 | `set_volume` | 调节输出音量 | `volume` |
-| `speak_text` | 让角色播报文本 | `text`, `voiceId` |
-| `play_reminder` | 触发语音提醒 | `title`, `voiceId` |
+| `speak_text` | 下载并播报角色语音 | `text`, `voiceId`, `audioPath`, `audioFormat`, `sampleRate` |
+| `play_reminder` | 触发角色语音提醒 | `title`, `voiceId`, `audioPath`, `audioFormat`, `sampleRate` |
 
 设备只有在执行成功或已经安全保存指令后才进行 ACK。
+
+`speak_text.audioPath` 是后端生成的相对地址，例如
+`/audio/550e8400-e29b-41d4-a716-446655440000.wav`。设备使用同一个
+`deviceAccessToken` 下载该 WAV；当前固件支持 8～48 kHz、16-bit PCM、单声道或双声道，
+最大 8 MB。设备完成播放后才 ACK，下载或播放失败时保留指令等待重试。
 
 ## 4. 确认指令
 

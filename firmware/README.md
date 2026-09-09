@@ -9,8 +9,11 @@
 - 连接 Wi-Fi 和 Nest.js 后端；
 - 创建设备会话、发送心跳并拉取设备指令；
 - 将音量和角色配置保存到 NVS 后 ACK；
-- 在音频硬件接入前暂缓 ACK 播报及闹钟指令；
-- 不使用屏幕、麦克风或功放引脚。
+- 驱动 1.54 英寸 ST7789 屏幕显示设备状态；
+- 驱动 HT517 I2S 功放并播放启动音；
+- 下载后端 CosyVoice 生成的 WAV，经 I2S 播放完成后 ACK `speak_text`；
+- 到点下载并播放当前角色音色的 `play_reminder` 语音提醒；
+- 麦克风仍处于硬件调试阶段，等 INMP441 到货后继续。
 
 ## 启用 ESP-IDF 6.1
 
@@ -46,5 +49,14 @@ SSID 和密码只保存在已被 `.gitignore` 排除的 `sdkconfig` 中。
 
 RGB 含义：启动时红绿蓝各一次；等待配置时蓝色闪烁；连接 Wi-Fi 时黄色；
 心跳成功短亮绿色；网络或后端失败短亮红色。
+
+## TTS 实机链路
+
+后端使用 `DASHSCOPE_API_KEY` 请求 CosyVoice，把生成的 WAV 缓存在
+`.data/tts/`，再向设备下发带 `audioPath` 的 `speak_text`。ESP32 使用设备令牌
+下载音频，屏幕依次显示 `DOWNLOADING`、`SPEAKING` 和 `SPEAK OK`。
+
+当前仅接受 WAV PCM 16-bit、单/双声道、8～48 kHz，单个文件最大 8 MB。
+音频下载或解析失败时不会 ACK，设备会在下一轮继续重试。
 
 `backups/` 保存烧录前读取的开发板内容，不提交到 Git。

@@ -8,6 +8,8 @@ import { databaseEntities } from './entities';
 import { HardwareController } from './hardware.controller';
 import { RemindersController } from './reminders.controller';
 import { StoreService } from './store.service';
+import { TtsService } from './tts.service';
+import { AudioController } from './audio.controller';
 
 @Module({
   imports: [TypeOrmModule.forFeature(databaseEntities)],
@@ -17,7 +19,8 @@ import { StoreService } from './store.service';
     DevicesController,
     RemindersController,
     HardwareController,
+    AudioController,
   ],
-  providers: [StoreService, UserAuthGuard, DeviceAuthGuard],
+  providers: [StoreService, TtsService, UserAuthGuard, DeviceAuthGuard],
 })
 export class FigureCompanionModule {}

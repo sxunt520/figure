@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
   OnModuleDestroy,
   OnModuleInit,
@@ -27,9 +28,11 @@ import {
   ReminderEntity,
   UserEntity,
 } from './entities';
+import { TtsService } from './tts.service';
 
 @Injectable()
 export class StoreService implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(StoreService.name);
   private readonly demoUser: User = {
     id: 'user-demo',
     displayName: '体验账号',
@@ -39,6 +42,7 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
   ]);
   private reminderTimer?: NodeJS.Timeout;
   private reminderTickRunning = false;
+  private readonly reminderRetryAfter = new Map<string, number>();
 
   constructor(
     @InjectRepository(UserEntity)
@@ -55,6 +59,7 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     private readonly commandRepository: Repository<DeviceCommandEntity>,
     @InjectRepository(DeviceEventEntity)
     private readonly eventRepository: Repository<DeviceEventEntity>,
+    private readonly tts: TtsService,
   ) {}
 
   async onModuleInit() {
@@ -161,10 +166,15 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     const character = device.characterId
       ? await this.requireCharacter(device.characterId)
       : null;
+    const speech = await this.tts.synthesize(text, character?.voiceId);
     return this.enqueueCommand(device.id, 'speak_text', {
       text,
       characterId: character?.id ?? null,
-      voiceId: character?.voiceId ?? null,
+      voiceId: speech.voice,
+      audioPath: speech.audioPath,
+      audioFormat: speech.format,
+      sampleRate: speech.sampleRate,
+      provider: speech.provider,
     });
   }
 
@@ -348,6 +358,7 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
         where: { enabled: true, scheduledAt: LessThanOrEqual(now) },
       });
       for (const reminder of reminders) {
+        if ((this.reminderRetryAfter.get(reminder.id) ?? 0) > Date.now()) continue;
         const device = await this.deviceRepository.findOne({
           where: { id: reminder.deviceId },
         });
@@ -355,22 +366,40 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
         const character = device.characterId
           ? await this.characterRepository.findOne({ where: { id: device.characterId } })
           : null;
-        await this.enqueueCommand(device.id, 'play_reminder', {
-          reminderId: reminder.id,
-          title: reminder.title,
-          characterId: character?.id ?? null,
-          voiceId: character?.voiceId ?? null,
-        });
-        reminder.lastTriggeredAt = now;
-        if (reminder.repeat === 'daily') {
-          const next = new Date(reminder.scheduledAt);
-          do next.setUTCDate(next.getUTCDate() + 1);
-          while (next.getTime() <= now.getTime());
-          reminder.scheduledAt = next;
-        } else {
-          reminder.enabled = false;
+        try {
+          const speech = await this.tts.synthesize(
+            `提醒时间到了，${reminder.title}`,
+            character?.voiceId,
+          );
+          await this.enqueueCommand(device.id, 'play_reminder', {
+            reminderId: reminder.id,
+            title: reminder.title,
+            characterId: character?.id ?? null,
+            voiceId: speech.voice,
+            audioPath: speech.audioPath,
+            audioFormat: speech.format,
+            sampleRate: speech.sampleRate,
+            provider: speech.provider,
+          });
+          reminder.lastTriggeredAt = now;
+          if (reminder.repeat === 'daily') {
+            const next = new Date(reminder.scheduledAt);
+            do next.setUTCDate(next.getUTCDate() + 1);
+            while (next.getTime() <= now.getTime());
+            reminder.scheduledAt = next;
+          } else {
+            reminder.enabled = false;
+          }
+          await this.reminderRepository.save(reminder);
+          this.reminderRetryAfter.delete(reminder.id);
+        } catch (error) {
+          this.reminderRetryAfter.set(reminder.id, Date.now() + 30_000);
+          this.logger.error(
+            `Reminder TTS failed reminder=${reminder.id}; retrying in 30 seconds: ${
+              error instanceof Error ? error.message : 'unknown error'
+            }`,
+          );
         }
-        await this.reminderRepository.save(reminder);
       }
     } finally {
       this.reminderTickRunning = false;

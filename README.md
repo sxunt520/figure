@@ -15,10 +15,10 @@ APP 演示账号
   └─ 绑定码绑定设备和角色
       ├─ 切换角色 → sync_character 指令
       ├─ 调节音量 → set_volume 指令
-      ├─ 远程播报 → speak_text 指令
+      ├─ 远程播报 → CosyVoice 生成 WAV → speak_text 指令 → ESP32 播放
       └─ 定时提醒 → play_reminder 指令
                          ↓
-                  ESP32 模拟器拉取并确认
+                  ESP32 真机或模拟器拉取并确认
 ```
 
 业务数据已经持久化到 MySQL/MariaDB，后端重启不会丢失绑定、提醒或设备指令。
@@ -42,6 +42,18 @@ DB_PASSWORD=
 DB_DATABASE=figure_companion
 DB_SYNCHRONIZE=true
 ```
+
+CosyVoice TTS 使用阿里云百炼 API Key：
+
+```dotenv
+DASHSCOPE_API_KEY=你的百炼_API_Key
+DASHSCOPE_TTS_MODEL=cosyvoice-v3-flash
+DASHSCOPE_TTS_DEFAULT_VOICE=longanyang
+```
+
+`ALIYUN_ACCESS_KEY_ID`、`ALIYUN_ACCESS_KEY_SECRET` 和 `ALIYUN_NLS_APP_KEY`
+预留给下一阶段的实时语音识别，不参与当前 TTS 请求。密钥只配置在根目录
+`.env`，不会下发到 APP 或 ESP32。
 
 本机已验证的数据库服务实际为 MariaDB 10.1.37，因此 JSON 数据使用兼容的文本 JSON 映射。开发环境会通过 TypeORM 自动同步表结构；上线前应关闭 `DB_SYNCHRONIZE` 并改用数据库迁移。
 
@@ -101,7 +113,7 @@ npx expo export --platform ios --output-dir /tmp/figure-expo-export
 2. 将 APP 的演示登录替换为现有 APP 用户 Token。
 3. 将 `figure_users` 演示用户映射替换为现有 APP 用户表和正式登录 Token。
 4. 将模拟对话服务替换为现有角色对话服务。
-5. 接入阿里云流式 ASR、音色复刻 TTS 和音频对象存储。
+5. 接入阿里云流式 ASR；CosyVoice TTS 的本地闭环已完成，量产时再迁移到对象存储。
 6. 语音实时对话改用 WebSocket 传输 Opus 音频；当前 HTTP 指令通道继续承担绑定、配置、提醒和控制。
 
 ## ESP32-S3 主板自检
@@ -114,7 +126,7 @@ npx expo export --platform ios --output-dir /tmp/figure-expo-export
 ## 目前有意保留的限制
 
 - 演示 Token 和预置设备凭证只用于本地开发。
-- 阿里云 `voiceId` 是占位值，没有调用收费接口。
+- 演示角色中的占位 `voiceId` 会回退到 `DASHSCOPE_TTS_DEFAULT_VOICE`；完成音色复刻后替换成正式音色 ID。
 - 没有实现 Wi-Fi 配网、OTA、解绑、设备恢复出厂和固件签名。
 - 提醒由运行中的 API 进程触发，正式版应改成持久化任务队列。
 

@@ -33,6 +33,7 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define HTTP_RESPONSE_CAPACITY 4096
 #define ACCESS_TOKEN_CAPACITY 80
+#define AUDIO_DOWNLOAD_MAX_BYTES (8U * 1024U * 1024U)
 
 static const char *TAG = "figure_device";
 static led_strip_handle_t rgb_led;
@@ -53,6 +54,7 @@ static void display_render_status(const char *line1);
 
 #ifdef CONFIG_FIGURE_ENABLE_SPEAKER
 static i2s_chan_handle_t speaker_tx_channel;
+static uint32_t speaker_sample_rate = 16000;
 
 static const int16_t sine32[] = {
     0, 195, 383, 556, 707, 831, 924, 981,
@@ -139,6 +141,167 @@ static void configure_speaker(void)
     speaker_play_tone(784, 220);
     speaker_write_silence(120);
     ESP_LOGI(TAG, "HT517 speaker self-test finished");
+}
+
+static uint16_t read_le16(const uint8_t *data)
+{
+    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+}
+
+static uint32_t read_le32(const uint8_t *data)
+{
+    return (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+           ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+}
+
+static bool speaker_set_sample_rate(uint32_t sample_rate)
+{
+    if (sample_rate == speaker_sample_rate) return true;
+
+    esp_err_t error = i2s_channel_disable(speaker_tx_channel);
+    if (error != ESP_OK) return false;
+    const i2s_std_clk_config_t clock_config = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
+    error = i2s_channel_reconfig_std_clock(speaker_tx_channel, &clock_config);
+    if (error == ESP_OK) error = i2s_channel_enable(speaker_tx_channel);
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "Speaker sample-rate change failed: %s", esp_err_to_name(error));
+        return false;
+    }
+    speaker_sample_rate = sample_rate;
+    return true;
+}
+
+static bool speaker_play_wav(const uint8_t *wav, size_t wav_length)
+{
+    if (wav_length < 44 || memcmp(wav, "RIFF", 4) != 0 || memcmp(wav + 8, "WAVE", 4) != 0) {
+        ESP_LOGE(TAG, "Downloaded audio is not a RIFF/WAVE file");
+        return false;
+    }
+
+    uint16_t audio_format = 0;
+    uint16_t channels = 0;
+    uint16_t bits_per_sample = 0;
+    uint32_t sample_rate = 0;
+    const uint8_t *pcm = NULL;
+    size_t pcm_length = 0;
+    size_t offset = 12;
+    while (offset + 8 <= wav_length) {
+        const uint32_t chunk_length = read_le32(wav + offset + 4);
+        const size_t data_offset = offset + 8;
+        if (memcmp(wav + offset, "fmt ", 4) == 0 && chunk_length >= 16) {
+            if (chunk_length > wav_length - data_offset) break;
+            audio_format = read_le16(wav + data_offset);
+            channels = read_le16(wav + data_offset + 2);
+            sample_rate = read_le32(wav + data_offset + 4);
+            bits_per_sample = read_le16(wav + data_offset + 14);
+        } else if (memcmp(wav + offset, "data", 4) == 0) {
+            pcm = wav + data_offset;
+            // DashScope returns a streaming-style WAV whose RIFF/data lengths
+            // use a large sentinel value. The downloaded HTTP body is complete,
+            // so in that case the remaining bytes are the actual PCM payload.
+            const size_t available = wav_length - data_offset;
+            pcm_length = chunk_length <= available ? chunk_length : available;
+            break;
+        } else if (chunk_length > wav_length - data_offset) {
+            break;
+        }
+        offset = data_offset + chunk_length + (chunk_length & 1U);
+    }
+
+    if (audio_format != 1 || (channels != 1 && channels != 2) || bits_per_sample != 16 ||
+        sample_rate < 8000 || sample_rate > 48000 || pcm == NULL || pcm_length == 0) {
+        ESP_LOGE(TAG, "Unsupported WAV: format=%u channels=%u rate=%" PRIu32 " bits=%u bytes=%u",
+                 audio_format, channels, sample_rate, bits_per_sample, (unsigned)pcm_length);
+        return false;
+    }
+    if (!speaker_set_sample_rate(sample_rate)) return false;
+
+    int16_t output[256 * 2];
+    const size_t input_frame_bytes = channels * sizeof(int16_t);
+    size_t position = 0;
+    while (position + input_frame_bytes <= pcm_length) {
+        const size_t remaining_frames = (pcm_length - position) / input_frame_bytes;
+        const size_t frame_count = remaining_frames > 256 ? 256 : remaining_frames;
+        for (size_t frame = 0; frame < frame_count; ++frame) {
+            const uint8_t *input = pcm + position + frame * input_frame_bytes;
+            int16_t left = (int16_t)read_le16(input);
+            int16_t right = channels == 2 ? (int16_t)read_le16(input + 2) : left;
+            output[frame * 2] = (int16_t)(((int32_t)left * current_volume) / 100);
+            output[frame * 2 + 1] = (int16_t)(((int32_t)right * current_volume) / 100);
+        }
+        size_t bytes_written = 0;
+        const esp_err_t error = i2s_channel_write(speaker_tx_channel, output,
+                                                   frame_count * 2 * sizeof(int16_t),
+                                                   &bytes_written, portMAX_DELAY);
+        if (error != ESP_OK) {
+            ESP_LOGE(TAG, "Speaker write failed: %s", esp_err_to_name(error));
+            return false;
+        }
+        position += frame_count * input_frame_bytes;
+    }
+    return true;
+}
+
+static bool download_and_play_audio(const char *path)
+{
+    char url[384];
+    if (path == NULL || path[0] != '/' ||
+        snprintf(url, sizeof(url), "%s%s", CONFIG_FIGURE_API_BASE_URL, path) >= (int)sizeof(url)) {
+        ESP_LOGE(TAG, "Invalid audio path");
+        return false;
+    }
+
+#ifdef CONFIG_FIGURE_ENABLE_DISPLAY
+    display_render_status("DOWNLOADING");
+#endif
+    esp_http_client_config_t config = {
+        .url = url,
+        .timeout_ms = 30000,
+        .buffer_size = 4096,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) return false;
+    char authorization[112];
+    snprintf(authorization, sizeof(authorization), "Bearer %s", access_token);
+    esp_http_client_set_header(client, "Authorization", authorization);
+
+    esp_err_t error = esp_http_client_open(client, 0);
+    const int64_t content_length = error == ESP_OK ? esp_http_client_fetch_headers(client) : -1;
+    const int status = error == ESP_OK ? esp_http_client_get_status_code(client) : -1;
+    if (error != ESP_OK || status != 200 || content_length <= 0 ||
+        content_length > AUDIO_DOWNLOAD_MAX_BYTES) {
+        ESP_LOGE(TAG, "Audio download rejected: error=%s status=%d bytes=%lld",
+                 esp_err_to_name(error), status, (long long)content_length);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    uint8_t *audio = heap_caps_malloc((size_t)content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (audio == NULL) audio = heap_caps_malloc((size_t)content_length, MALLOC_CAP_8BIT);
+    if (audio == NULL) {
+        ESP_LOGE(TAG, "Cannot allocate %lld bytes for audio", (long long)content_length);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    const int received = esp_http_client_read_response(client, (char *)audio, (int)content_length);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    if (received != content_length) {
+        ESP_LOGE(TAG, "Incomplete audio download: expected=%lld received=%d",
+                 (long long)content_length, received);
+        free(audio);
+        return false;
+    }
+
+#ifdef CONFIG_FIGURE_ENABLE_DISPLAY
+    display_render_status("SPEAKING");
+#endif
+    const bool played = speaker_play_wav(audio, (size_t)received);
+    free(audio);
+    return played;
 }
 #endif
 
@@ -758,8 +921,20 @@ static bool apply_config_command(const cJSON *command)
 
     if (strcmp(type->valuestring, "speak_text") == 0) {
         const cJSON *text = cJSON_GetObjectItemCaseSensitive(payload, "text");
-        ESP_LOGI(TAG, "Mock speak_text: %s",
+        const cJSON *audio_path = cJSON_GetObjectItemCaseSensitive(payload, "audioPath");
+        ESP_LOGI(TAG, "Speak text: %s",
                  cJSON_IsString(text) && text->valuestring != NULL ? text->valuestring : "");
+#ifdef CONFIG_FIGURE_ENABLE_SPEAKER
+        if (!cJSON_IsString(audio_path) || audio_path->valuestring == NULL ||
+            !download_and_play_audio(audio_path->valuestring)) {
+#ifdef CONFIG_FIGURE_ENABLE_DISPLAY
+            display_render_status("SPEAK FAIL");
+#endif
+            return false;
+        }
+#else
+        return false;
+#endif
 #ifdef CONFIG_FIGURE_ENABLE_DISPLAY
         display_render_status("SPEAK OK");
 #endif
@@ -768,8 +943,20 @@ static bool apply_config_command(const cJSON *command)
 
     if (strcmp(type->valuestring, "play_reminder") == 0) {
         const cJSON *title = cJSON_GetObjectItemCaseSensitive(payload, "title");
-        ESP_LOGI(TAG, "Mock play_reminder: %s",
+        const cJSON *audio_path = cJSON_GetObjectItemCaseSensitive(payload, "audioPath");
+        ESP_LOGI(TAG, "Play reminder: %s",
                  cJSON_IsString(title) && title->valuestring != NULL ? title->valuestring : "");
+#ifdef CONFIG_FIGURE_ENABLE_SPEAKER
+        if (!cJSON_IsString(audio_path) || audio_path->valuestring == NULL ||
+            !download_and_play_audio(audio_path->valuestring)) {
+#ifdef CONFIG_FIGURE_ENABLE_DISPLAY
+            display_render_status("REMIND FAIL");
+#endif
+            return false;
+        }
+#else
+        return false;
+#endif
 #ifdef CONFIG_FIGURE_ENABLE_DISPLAY
         display_render_status("REMIND OK");
 #endif
@@ -805,7 +992,7 @@ static int fetch_commands(void)
         if (apply_config_command(command)) {
             if (acknowledge_command(id->valuestring)) {
                 ESP_LOGI(TAG, "Command acknowledged: %s", id->valuestring);
-                post_device_event("command_acknowledged", "设备已完成模拟执行并确认", type->valuestring);
+                post_device_event("command_acknowledged", "设备已完成执行并确认", type->valuestring);
             }
         } else {
             ESP_LOGW(TAG, "Command deferred until its hardware is available: %s", type->valuestring);
