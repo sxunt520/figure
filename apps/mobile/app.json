@@ -1,0 +1,21 @@
+{
+  "expo": {
+    "name": "手办伙伴",
+    "slug": "figure-companion-mvp",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#F6F4FF"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.example.figurecompanion"
+    },
+    "android": {
+      "package": "com.example.figurecompanion"
+    }
+  }
+}

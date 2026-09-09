@@ -1,0 +1,141 @@
+menu "Figure Board Self-Test"
+
+    config BLINK_LED_STRIP
+        bool
+        default y
+
+    config BLINK_LED_STRIP_BACKEND_RMT
+        bool
+        default y
+
+    config BLINK_GPIO
+        int "On-board addressable RGB LED GPIO"
+        range 0 48
+        default 48
+        help
+            The current ESP32-S3 development board is expected to use GPIO48.
+            Some official ESP32-S3-DevKitC-1 v1.1 boards use GPIO38 instead.
+
+    config FIGURE_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+
+    config FIGURE_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+
+    config FIGURE_API_BASE_URL
+        string "Figure API base URL"
+        default "http://192.168.18.225:3000/v1"
+
+    config FIGURE_DEVICE_HARDWARE_ID
+        string "Development hardware ID"
+        default "ESP32S3-DEMO-001"
+
+    config FIGURE_DEVICE_SECRET
+        string "Development device secret"
+        default "figure-dev-secret-001"
+
+    config FIGURE_HEARTBEAT_INTERVAL_MS
+        int "Heartbeat interval in milliseconds"
+        range 3000 60000
+        default 10000
+
+    config FIGURE_ENABLE_DISPLAY
+        bool "Enable ST7789 SPI display"
+        default n
+        help
+            Enable the 1.54-inch ST7789 SPI TFT display after its header pins
+            are soldered and connected to the ESP32-S3 breadboard.
+
+    config FIGURE_DISPLAY_WIDTH
+        int "Display width"
+        depends on FIGURE_ENABLE_DISPLAY
+        default 240
+
+    config FIGURE_DISPLAY_HEIGHT
+        int "Display height"
+        depends on FIGURE_ENABLE_DISPLAY
+        default 240
+
+    config FIGURE_DISPLAY_SPI_HOST
+        int "Display SPI host number"
+        depends on FIGURE_ENABLE_DISPLAY
+        default 2
+
+    config FIGURE_DISPLAY_PIN_SCLK
+        int "Display SCL/SCLK GPIO"
+        depends on FIGURE_ENABLE_DISPLAY
+        default 21
+
+    config FIGURE_DISPLAY_PIN_MOSI
+        int "Display SDA/MOSI GPIO"
+        depends on FIGURE_ENABLE_DISPLAY
+        default 47
+
+    config FIGURE_DISPLAY_PIN_DC
+        int "Display DC GPIO"
+        depends on FIGURE_ENABLE_DISPLAY
+        default 40
+
+    config FIGURE_DISPLAY_PIN_RST
+        int "Display RST GPIO"
+        depends on FIGURE_ENABLE_DISPLAY
+        default 45
+
+    config FIGURE_DISPLAY_PIN_CS
+        int "Display CS GPIO (-1 if tied to GND)"
+        depends on FIGURE_ENABLE_DISPLAY
+        default 41
+
+    config FIGURE_DISPLAY_PIN_BL
+        int "Display BL/backlight GPIO (-1 if tied to 3V3)"
+        depends on FIGURE_ENABLE_DISPLAY
+        default 42
+
+    config FIGURE_ENABLE_SPEAKER
+        bool "Enable HT517 I2S speaker"
+        default n
+        help
+            Enable the HT517 I2S amplifier and play a short, low-volume
+            three-note self-test during startup.
+
+    config FIGURE_SPEAKER_PIN_BCLK
+        int "HT517 BCLK / DI0 GPIO"
+        depends on FIGURE_ENABLE_SPEAKER
+        default 15
+
+    config FIGURE_SPEAKER_PIN_LRCK
+        int "HT517 LRCK / DI1 GPIO"
+        depends on FIGURE_ENABLE_SPEAKER
+        default 16
+
+    config FIGURE_SPEAKER_PIN_DATA
+        int "HT517 SDIN / DI2 GPIO"
+        depends on FIGURE_ENABLE_SPEAKER
+        default 7
+
+    config FIGURE_ENABLE_MICROPHONE
+        bool "Enable ZTS6672 I2S microphone"
+        default n
+        help
+            Enable the ZTS6672 I2S microphone and run a 20-second input-level
+            self-test during startup. The microphone uses a separate I2S port
+            from the speaker.
+
+    config FIGURE_MICROPHONE_PIN_SCK
+        int "ZTS6672 SCK GPIO"
+        depends on FIGURE_ENABLE_MICROPHONE
+        default 5
+
+    config FIGURE_MICROPHONE_PIN_WS
+        int "ZTS6672 WS GPIO"
+        depends on FIGURE_ENABLE_MICROPHONE
+        default 4
+
+    config FIGURE_MICROPHONE_PIN_SD
+        int "ZTS6672 SD GPIO"
+        depends on FIGURE_ENABLE_MICROPHONE
+        default 6
+
+endmenu
