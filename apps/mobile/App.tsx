@@ -1,4 +1,6 @@
 import { StatusBar } from 'expo-status-bar';
+import { NavigationContainer, getFocusedRouteNameFromRoute } from '@react-navigation/native';
+import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
@@ -12,8 +14,11 @@ import {
   View,
 } from 'react-native';
 import { API_BASE_URL, api } from './src/api';
+import { FigureFlow } from './src/screens/FigureFlow';
+import { palette } from './src/theme';
 import {
   Character,
+  ConversationMessage,
   Device,
   DeviceCommand,
   DeviceEvent,
@@ -21,22 +26,22 @@ import {
   User,
 } from './src/types';
 
-type Tab = 'home' | 'bind' | 'reminders';
+type RootTabParamList = {
+  AI手办: undefined;
+  设备: undefined;
+  绑定: undefined;
+  提醒: undefined;
+};
 
-const palette = {
-  ink: '#211A2E',
-  muted: '#766E83',
-  primary: '#7656E8',
-  primarySoft: '#EEE9FF',
-  surface: '#FFFFFF',
-  canvas: '#F7F5FC',
-  border: '#E8E3F0',
-  green: '#27A56B',
-  red: '#D95555',
+const Tabs = createBottomTabNavigator<RootTabParamList>();
+const tabIcons: Record<keyof RootTabParamList, string> = {
+  AI手办: '◉',
+  设备: '⌁',
+  绑定: '⌘',
+  提醒: '◷',
 };
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>('home');
   const [token, setToken] = useState('');
   const [user, setUser] = useState<User | null>(null);
   const [characters, setCharacters] = useState<Character[]>([]);
@@ -44,6 +49,7 @@ export default function App() {
   const [reminders, setReminders] = useState<Reminder[]>([]);
   const [commands, setCommands] = useState<DeviceCommand[]>([]);
   const [events, setEvents] = useState<DeviceEvent[]>([]);
+  const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState('');
 
@@ -63,15 +69,18 @@ export default function App() {
 
       const firstDevice = nextDevices[0] ?? null;
       if (firstDevice) {
-        const [nextCommands, nextEvents] = await Promise.all([
+        const [nextCommands, nextEvents, nextMessages] = await Promise.all([
           api.listDeviceCommands(activeToken, firstDevice.id),
           api.listDeviceEvents(activeToken, firstDevice.id),
+          api.listConversationMessages(activeToken, firstDevice.id),
         ]);
         setCommands(nextCommands);
         setEvents(nextEvents);
+        setMessages(nextMessages);
       } else {
         setCommands([]);
         setEvents([]);
+        setMessages([]);
       }
     },
     [token],
@@ -118,70 +127,141 @@ export default function App() {
     return (
       <SafeAreaView style={styles.centered}>
         <ActivityIndicator color={palette.primary} size="large" />
-        <Text style={styles.loadingText}>正在连接手办伙伴服务…</Text>
+        <Text style={styles.loadingText}>正在连接屿宙AI手办服务…</Text>
       </SafeAreaView>
     );
   }
 
   return (
-    <SafeAreaView style={styles.safeArea}>
+    <NavigationContainer>
       <StatusBar style="dark" />
+      <Tabs.Navigator
+        initialRouteName="AI手办"
+        screenOptions={({ route }) => {
+          const nestedRoute = getFocusedRouteNameFromRoute(route);
+          const hideTabBar = route.name === 'AI手办' && nestedRoute != null && nestedRoute !== 'FigureHome';
+          return {
+            headerShown: false,
+            tabBarActiveTintColor: palette.primaryDark,
+            tabBarInactiveTintColor: '#928B94',
+            tabBarLabelStyle: { fontSize: 11, fontWeight: '700', marginBottom: 5 },
+            tabBarStyle: hideTabBar
+              ? { display: 'none' }
+              : {
+                  height: 68,
+                  paddingTop: 7,
+                  backgroundColor: palette.surface,
+                  borderTopColor: palette.border,
+                },
+            tabBarIcon: ({ color }: { color: string }) => (
+              <Text style={{ color, fontSize: 21, fontWeight: '800' }}>
+                {tabIcons[route.name]}
+              </Text>
+            ),
+          };
+        }}
+      >
+        <Tabs.Screen name="AI手办">
+          {() => <FigureFlow device={device} token={token} onDeviceChanged={refresh} />}
+        </Tabs.Screen>
+        <Tabs.Screen name="设备">
+          {({ navigation }) => (
+            <DebugScreenFrame
+              title="设备调试"
+              userName={user?.displayName}
+              busy={busy}
+              error={error}
+              onClearError={() => setError('')}
+            >
+              <HomeScreen
+                token={token}
+                device={device}
+                characters={characters}
+                commands={commands}
+                events={events}
+                messages={messages}
+                onAction={perform}
+                onNeedBind={() => navigation.navigate('绑定')}
+              />
+            </DebugScreenFrame>
+          )}
+        </Tabs.Screen>
+        <Tabs.Screen name="绑定">
+          {({ navigation }) => (
+            <DebugScreenFrame
+              title="绑定调试"
+              userName={user?.displayName}
+              busy={busy}
+              error={error}
+              onClearError={() => setError('')}
+            >
+              <BindScreen
+                token={token}
+                device={device}
+                characters={characters}
+                onAction={perform}
+                onBound={() => navigation.navigate('设备')}
+              />
+            </DebugScreenFrame>
+          )}
+        </Tabs.Screen>
+        <Tabs.Screen name="提醒">
+          {() => (
+            <DebugScreenFrame
+              title="提醒调试"
+              userName={user?.displayName}
+              busy={busy}
+              error={error}
+              onClearError={() => setError('')}
+            >
+              <ReminderScreen
+                token={token}
+                device={device}
+                reminders={reminders}
+                onAction={perform}
+              />
+            </DebugScreenFrame>
+          )}
+        </Tabs.Screen>
+      </Tabs.Navigator>
+    </NavigationContainer>
+  );
+}
+
+function DebugScreenFrame({
+  title,
+  userName,
+  busy,
+  error,
+  onClearError,
+  children,
+}: {
+  title: string;
+  userName?: string;
+  busy: boolean;
+  error: string;
+  onClearError: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <SafeAreaView style={styles.safeArea}>
       <View style={styles.header}>
         <View>
-          <Text style={styles.eyebrow}>FIGURE COMPANION</Text>
-          <Text style={styles.title}>你好，{user?.displayName ?? '朋友'}</Text>
+          <Text style={styles.eyebrow}>屿宙AI手办 · 开发工具</Text>
+          <Text style={styles.title}>{title}</Text>
+          <Text style={styles.headerUser}>你好，{userName ?? '朋友'}</Text>
         </View>
         {busy ? <ActivityIndicator color={palette.primary} /> : null}
       </View>
-
       {error ? (
-        <Pressable style={styles.errorBanner} onPress={() => setError('')}>
+        <Pressable style={styles.errorBanner} onPress={onClearError}>
           <Text style={styles.errorText}>{error}</Text>
         </Pressable>
       ) : null}
-
-      <ScrollView contentContainerStyle={styles.content}>
-        {tab === 'home' ? (
-          <HomeScreen
-            token={token}
-            device={device}
-            characters={characters}
-            commands={commands}
-            events={events}
-            onAction={perform}
-            onNeedBind={() => setTab('bind')}
-          />
-        ) : null}
-        {tab === 'bind' ? (
-          <BindScreen
-            token={token}
-            device={device}
-            characters={characters}
-            onAction={perform}
-            onBound={() => setTab('home')}
-          />
-        ) : null}
-        {tab === 'reminders' ? (
-          <ReminderScreen
-            token={token}
-            device={device}
-            reminders={reminders}
-            onAction={perform}
-          />
-        ) : null}
-
+      <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+        {children}
         <Text style={styles.endpoint}>API：{API_BASE_URL}</Text>
       </ScrollView>
-
-      <View style={styles.tabBar}>
-        <TabButton active={tab === 'home'} label="设备" onPress={() => setTab('home')} />
-        <TabButton active={tab === 'bind'} label="绑定" onPress={() => setTab('bind')} />
-        <TabButton
-          active={tab === 'reminders'}
-          label="提醒"
-          onPress={() => setTab('reminders')}
-        />
-      </View>
     </SafeAreaView>
   );
 }
@@ -192,6 +272,7 @@ function HomeScreen({
   characters,
   commands,
   events,
+  messages,
   onAction,
   onNeedBind,
 }: {
@@ -200,16 +281,45 @@ function HomeScreen({
   characters: Character[];
   commands: DeviceCommand[];
   events: DeviceEvent[];
+  messages: ConversationMessage[];
   onAction: (action: () => Promise<unknown>, message?: string) => Promise<void>;
   onNeedBind: () => void;
 }) {
   const [speech, setSpeech] = useState('该起床啦，今天也要元气满满！');
   const [nameDraft, setNameDraft] = useState(device?.name ?? '');
+  const [nfcCharacterId, setNfcCharacterId] = useState(
+    device?.characterId ?? characters[0]?.id ?? '',
+  );
   const lastSeenText = formatLastSeen(device?.lastSeenAt ?? null);
+  const latestSpeechEvent = events.find(
+    (event) =>
+      event.type === 'speech_recognized' || event.type === 'speech_empty',
+  );
+  const latestTranscript =
+    latestSpeechEvent && typeof latestSpeechEvent.payload.text === 'string'
+      ? latestSpeechEvent.payload.text
+      : '';
+  const latestNfcEvent = events.find((event) => event.type === 'nfc_tag_present');
+  const latestNfcUid =
+    device?.nfcTag?.uid ??
+    (latestNfcEvent && typeof latestNfcEvent.payload.uid === 'string'
+      ? latestNfcEvent.payload.uid
+      : '');
+  const latestNfcTime =
+    device?.nfcTag?.lastSeenAt ??
+    (latestNfcEvent ? latestNfcEvent.createdAt : '');
+  const nfcCharacter =
+    characters.find((character) => character.id === nfcCharacterId) ?? null;
 
   useEffect(() => {
     setNameDraft(device?.name ?? '');
   }, [device?.id, device?.name]);
+
+  useEffect(() => {
+    if (!nfcCharacterId && characters[0]) {
+      setNfcCharacterId(device?.characterId ?? characters[0].id);
+    }
+  }, [characters, device?.characterId, nfcCharacterId]);
 
   if (!device) {
     return (
@@ -291,6 +401,96 @@ function HomeScreen({
         ))}
       </View>
 
+      <SectionTitle
+        title="NFC 手办身份"
+        subtitle="刷卡后选择角色，UID 会保存到 MySQL"
+      />
+      <View style={styles.panel}>
+        <View style={styles.nfcScanBox}>
+          <Text style={styles.transcriptLabel}>底座最近读到的 UID</Text>
+          <Text style={styles.nfcUidText}>
+            {latestNfcUid || '等待刷卡…'}
+          </Text>
+          {device.nfcTag ? (
+            <Text style={styles.meta}>
+              {device.nfcTag.matched
+                ? `已匹配角色：${device.nfcTag.characterName ?? '未知角色'}`
+                : '这张卡还没有绑定角色'}
+            </Text>
+          ) : null}
+          {latestNfcTime ? (
+            <Text style={styles.meta}>
+              {formatBeijingDateTime(latestNfcTime)}
+            </Text>
+          ) : null}
+        </View>
+        <Text style={styles.fieldLabel}>这张卡代表哪个角色？</Text>
+        <View style={styles.chipRow}>
+          {characters.map((character) => (
+            <Chip
+              key={character.id}
+              label={character.name}
+              selected={nfcCharacterId === character.id}
+              onPress={() => setNfcCharacterId(character.id)}
+            />
+          ))}
+        </View>
+        <PrimaryButton
+          label={nfcCharacter ? `绑定到「${nfcCharacter.name}」` : '选择角色'}
+          disabled={!latestNfcUid || !nfcCharacter}
+          onPress={() => {
+            if (!nfcCharacter || !latestNfcUid) return;
+            void onAction(
+              () =>
+                api.bindCharacterNfcTag(
+                  token,
+                  nfcCharacter.id,
+                  latestNfcUid,
+                ),
+              `UID ${latestNfcUid} 已绑定到角色“${nfcCharacter.name}”`,
+            );
+          }}
+        />
+        <View style={styles.nfcBindings}>
+          {characters.map((character) => (
+            <View key={character.id} style={styles.nfcBindingRow}>
+              <View style={styles.reminderContent}>
+                <Text style={styles.reminderTitle}>{character.name}</Text>
+                <Text style={styles.meta}>
+                  {character.nfcTagUid ?? '尚未绑定标签'}
+                </Text>
+              </View>
+              {character.nfcTagUid ? (
+                <Pressable
+                  style={styles.deleteButton}
+                  onPress={() =>
+                    Alert.alert(
+                      '解除 NFC 标签',
+                      `确定解除“${character.name}”与 ${character.nfcTagUid} 的绑定吗？`,
+                      [
+                        { text: '取消', style: 'cancel' },
+                        {
+                          text: '解除',
+                          style: 'destructive',
+                          onPress: () =>
+                            void onAction(
+                              () =>
+                                api.unbindCharacterNfcTag(token, character.id),
+                              'NFC 标签绑定已解除',
+                            ),
+                        },
+                      ],
+                    )
+                  }
+                >
+                  <Text style={styles.deleteText}>解除</Text>
+                </Pressable>
+              ) : null}
+            </View>
+          ))}
+        </View>
+      </View>
+
       <SectionTitle title="让角色说一句" subtitle="用于验证 APP → 后端 → 设备联动" />
       <View style={styles.panel}>
         <TextInput
@@ -333,6 +533,71 @@ function HomeScreen({
         />
       </View>
 
+
+      <SectionTitle
+        title="最近对话"
+        subtitle="当前角色最近 30 条记忆"
+      />
+      <View style={styles.chatPanel}>
+        {messages.length === 0 ? (
+          <Text style={styles.emptyText}>还没有对话，点击“开始说话”说一句吧。</Text>
+        ) : (
+          messages.slice(-10).map((message) => (
+            <View
+              key={message.id}
+              style={[
+                styles.chatBubble,
+                message.role === 'user'
+                  ? styles.userBubble
+                  : styles.assistantBubble,
+              ]}
+            >
+              <Text style={styles.chatRole}>
+                {message.role === 'user'
+                  ? '我'
+                  : device.character?.name ?? '角色'}
+              </Text>
+              <Text style={styles.chatText}>{message.content}</Text>
+              <Text style={styles.chatTime}>
+                {formatBeijingTime(message.createdAt)}
+              </Text>
+            </View>
+          ))
+        )}
+      </View>
+
+      <SectionTitle
+        title="和手办说话"
+        subtitle="半双工：静音自动结束，最长 10 秒"
+      />
+      <View style={styles.panel}>
+        <Text style={styles.formHelp}>
+          点击后等待底座屏幕显示 LISTENING，再对着麦克风说话；说完安静约 1 秒会自动结束。
+        </Text>
+        <PrimaryButton
+          label="开始说话"
+          onPress={() =>
+            void onAction(
+              () => api.startListening(token, device.id),
+              '指令已发送；看到底座显示 LISTENING 后开始说话',
+            )
+          }
+        />
+        <View style={styles.transcriptBox}>
+          <Text style={styles.transcriptLabel}>最近识别结果</Text>
+          <Text style={styles.transcriptText}>
+            {latestSpeechEvent
+              ? latestTranscript || '没有识别到有效语音，请靠近麦克风后重试。'
+              : '还没有录音记录'}
+          </Text>
+          {latestSpeechEvent ? (
+            <Text style={styles.meta}>
+              {formatBeijingDateTime(latestSpeechEvent.createdAt)}
+            </Text>
+          ) : null}
+        </View>
+      </View>
+
       <SectionTitle
         title="设备指令队列"
         subtitle="最近 20 条，已完成代表 ESP32 已 ACK"
@@ -345,9 +610,9 @@ function HomeScreen({
             <TimelineCard
               key={command.id}
               title={formatCommandType(command.type)}
-              subtitle={`${formatCommandPayload(command.payload)} · ${new Date(
+              subtitle={`${formatCommandPayload(command.payload)} · ${formatBeijingTime(
                 command.createdAt,
-              ).toLocaleTimeString()}`}
+              )}`}
               status={command.acknowledgedAt ? '已完成' : '等待设备'}
               tone={command.acknowledgedAt ? 'success' : 'pending'}
             />
@@ -364,9 +629,9 @@ function HomeScreen({
             <TimelineCard
               key={event.id}
               title={event.type}
-              subtitle={`${formatEventPayload(event.payload)} · ${new Date(
+              subtitle={`${formatEventPayload(event.payload)} · ${formatBeijingTime(
                 event.createdAt,
-              ).toLocaleTimeString()}`}
+              )}`}
               status="已接收"
               tone="muted"
             />
@@ -402,7 +667,7 @@ function BindScreen({
     return (
       <EmptyCard
         title="设备已经绑定"
-        body={`${device.name} 已属于当前账号。第一版暂不提供解绑，避免误操作。`}
+        body={`${device.name} 已属于当前账号。可在“AI手办 → 智能底座 → 设备管理”中解绑。`}
         action="查看设备"
         onPress={onBound}
       />
@@ -467,6 +732,7 @@ function ReminderScreen({
   const [title, setTitle] = useState('喝水休息一下');
   const [delayMinutes, setDelayMinutes] = useState(1);
   const [repeat, setRepeat] = useState<'none' | 'daily'>('none');
+  const [kind, setKind] = useState<'reminder' | 'alarm'>('reminder');
   const ordered = useMemo(
     () => [...reminders].sort((a, b) => a.scheduledAt.localeCompare(b.scheduledAt)),
     [reminders],
@@ -486,6 +752,19 @@ function ReminderScreen({
     <>
       <View style={styles.panel}>
         <Text style={styles.formTitle}>创建语音提醒</Text>
+        <FieldLabel label="类型" />
+        <View style={styles.chipRow}>
+          <Chip
+            label="主动提醒"
+            selected={kind === 'reminder'}
+            onPress={() => setKind('reminder')}
+          />
+          <Chip
+            label="闹钟"
+            selected={kind === 'alarm'}
+            onPress={() => setKind('alarm')}
+          />
+        </View>
         <FieldLabel label="提醒内容" />
         <TextInput style={styles.input} value={title} onChangeText={setTitle} />
         <FieldLabel label="测试触发时间" />
@@ -515,6 +794,7 @@ function ReminderScreen({
                   title: title.trim(),
                   scheduledAt: new Date(Date.now() + delayMinutes * 60_000).toISOString(),
                   repeat,
+                  kind,
                 }),
               '提醒已经创建',
             )
@@ -530,9 +810,11 @@ function ReminderScreen({
           ordered.map((reminder) => (
             <View key={reminder.id} style={styles.reminderCard}>
               <View style={styles.reminderContent}>
-                <Text style={styles.reminderTitle}>{reminder.title}</Text>
+                <Text style={styles.reminderTitle}>
+                  {reminder.kind === 'alarm' ? '闹钟' : '提醒'} · {reminder.title}
+                </Text>
                 <Text style={styles.meta}>
-                  {new Date(reminder.scheduledAt).toLocaleString()} ·{' '}
+                  {formatBeijingDateTime(reminder.scheduledAt)} ·{' '}
                   {reminder.repeat === 'daily' ? '每天' : '单次'}
                 </Text>
               </View>
@@ -740,7 +1022,32 @@ function formatLastSeen(value: string | null) {
   if (seconds < 60) return `${seconds} 秒前`;
   const minutes = Math.round(seconds / 60);
   if (minutes < 60) return `${minutes} 分钟前`;
-  return new Date(value).toLocaleString();
+  return formatBeijingDateTime(value);
+}
+
+function formatBeijingDateTime(value: string | number | Date) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '时间未知';
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(date);
+}
+
+function formatBeijingTime(value: string | number | Date) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '时间未知';
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(date);
 }
 
 function formatCommandType(type: DeviceCommand['type']) {
@@ -748,6 +1055,7 @@ function formatCommandType(type: DeviceCommand['type']) {
     sync_character: '同步角色',
     play_reminder: '播放提醒',
     speak_text: '测试播报',
+    start_listening: '录音并识别',
     set_volume: '设置音量',
   };
   return labels[type] ?? type;
@@ -757,6 +1065,9 @@ function formatCommandPayload(payload: Record<string, unknown>) {
   if (typeof payload.text === 'string') return payload.text;
   if (typeof payload.title === 'string') return payload.title;
   if (typeof payload.volume === 'number') return `音量 ${payload.volume}%`;
+  if (typeof payload.durationMs === 'number') {
+    return `录音 ${Math.round(payload.durationMs / 1000)} 秒`;
+  }
   if (
     payload.character &&
     typeof payload.character === 'object' &&
@@ -772,7 +1083,16 @@ function formatEventPayload(payload: Record<string, unknown>) {
   const keys = Object.keys(payload);
   if (keys.length === 0) return '无附加内容';
   if (typeof payload.message === 'string') return payload.message;
+  if (typeof payload.text === 'string') return payload.text || '未识别到有效语音';
   if (typeof payload.reason === 'string') return payload.reason;
+  if (typeof payload.uid === 'string') {
+    if (typeof payload.characterName === 'string') {
+      return `${payload.uid} → ${payload.characterName}${
+        payload.switched ? '（已切换）' : ''
+      }`;
+    }
+    return `${payload.uid}（未绑定角色）`;
+  }
   return keys.slice(0, 3).join(' / ');
 }
 
@@ -783,6 +1103,7 @@ const styles = StyleSheet.create({
   header: { paddingHorizontal: 22, paddingTop: 16, paddingBottom: 14, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   eyebrow: { color: palette.primary, fontSize: 11, fontWeight: '800', letterSpacing: 1.4 },
   title: { color: palette.ink, fontSize: 27, fontWeight: '800', marginTop: 4 },
+  headerUser: { color: palette.muted, fontSize: 12, marginTop: 4 },
   errorBanner: { marginHorizontal: 18, marginBottom: 8, padding: 12, borderRadius: 12, backgroundColor: '#FDECEC' },
   errorText: { color: palette.red, fontSize: 13 },
   content: { paddingHorizontal: 18, paddingBottom: 26 },
@@ -826,6 +1147,20 @@ const styles = StyleSheet.create({
   volumeText: { color: palette.ink, fontSize: 22, fontWeight: '800' },
   formTitle: { color: palette.ink, fontSize: 22, fontWeight: '800' },
   formHelp: { color: palette.muted, fontSize: 13, lineHeight: 20, marginBottom: 4 },
+  transcriptBox: { backgroundColor: palette.primarySoft, borderRadius: 14, padding: 14 },
+  transcriptLabel: { color: palette.primary, fontSize: 11, fontWeight: '800' },
+  transcriptText: { color: palette.ink, fontSize: 16, fontWeight: '700', lineHeight: 24, marginTop: 6 },
+  nfcScanBox: { backgroundColor: palette.primarySoft, borderRadius: 14, padding: 14 },
+  nfcUidText: { color: palette.ink, fontSize: 20, fontWeight: '800', letterSpacing: 1.2, marginTop: 6 },
+  nfcBindings: { borderTopWidth: 1, borderTopColor: palette.border, marginTop: 2 },
+  nfcBindingRow: { minHeight: 58, flexDirection: 'row', alignItems: 'center', borderBottomWidth: 1, borderBottomColor: palette.border, paddingVertical: 9 },
+  chatPanel: { backgroundColor: palette.surface, borderRadius: 20, padding: 14, borderWidth: 1, borderColor: palette.border, gap: 10 },
+  chatBubble: { maxWidth: '88%', borderRadius: 15, paddingHorizontal: 13, paddingVertical: 10 },
+  userBubble: { alignSelf: 'flex-end', backgroundColor: palette.primarySoft },
+  assistantBubble: { alignSelf: 'flex-start', backgroundColor: '#F2EFF6' },
+  chatRole: { color: palette.primary, fontSize: 11, fontWeight: '800', marginBottom: 4 },
+  chatText: { color: palette.ink, fontSize: 14, lineHeight: 21 },
+  chatTime: { color: palette.muted, fontSize: 10, marginTop: 4 },
   fieldLabel: { color: palette.ink, fontSize: 13, fontWeight: '700', marginTop: 5 },
   chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   chip: { paddingHorizontal: 13, paddingVertical: 9, borderRadius: 999, backgroundColor: '#F2EFF6' },

@@ -10,6 +10,8 @@ import { RemindersController } from './reminders.controller';
 import { StoreService } from './store.service';
 import { TtsService } from './tts.service';
 import { AudioController } from './audio.controller';
+import { AsrService } from './asr.service';
+import { AiChatService } from './ai-chat.service';
 
 @Module({
   imports: [TypeOrmModule.forFeature(databaseEntities)],
@@ -21,6 +23,13 @@ import { AudioController } from './audio.controller';
     HardwareController,
     AudioController,
   ],
-  providers: [StoreService, TtsService, UserAuthGuard, DeviceAuthGuard],
+  providers: [
+    StoreService,
+    TtsService,
+    AsrService,
+    AiChatService,
+    UserAuthGuard,
+    DeviceAuthGuard,
+  ],
 })
 export class FigureCompanionModule {}

@@ -21,7 +21,7 @@ import { FigureCompanionModule } from './modules/figure-companion/figure-compani
       entities: databaseEntities,
       synchronize: process.env.DB_SYNCHRONIZE !== 'false',
       charset: 'utf8mb4',
-      timezone: 'Z',
+      timezone: '+08:00',
       retryAttempts: 3,
       retryDelay: 1000,
     }),

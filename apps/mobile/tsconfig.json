@@ -3,5 +3,6 @@
   "compilerOptions": {
     "strict": true,
     "noEmit": true
-  }
+  },
+  "exclude": ["android", "ios", "node_modules"]
 }

@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
@@ -39,6 +40,14 @@ export class DevicesController {
   @Post('bind')
   bindDevice(@Req() request: UserRequest, @Body() dto: BindDeviceDto) {
     return this.store.bindDevice(request.user.id, dto);
+  }
+
+  @Delete(':deviceId/binding')
+  unbindDevice(
+    @Req() request: UserRequest,
+    @Param('deviceId') deviceId: string,
+  ) {
+    return this.store.unbindDevice(request.user.id, deviceId);
   }
 
   @Patch(':deviceId/character')
@@ -81,6 +90,14 @@ export class DevicesController {
     return this.store.speakText(request.user.id, deviceId, dto.text);
   }
 
+  @Post(':deviceId/listen')
+  startListening(
+    @Req() request: UserRequest,
+    @Param('deviceId') deviceId: string,
+  ) {
+    return this.store.startListening(request.user.id, deviceId);
+  }
+
   @Get(':deviceId/commands')
   listCommands(
     @Req() request: UserRequest,
@@ -95,5 +112,13 @@ export class DevicesController {
     @Param('deviceId') deviceId: string,
   ) {
     return this.store.listDeviceEvents(request.user.id, deviceId);
+  }
+
+  @Get(':deviceId/messages')
+  listMessages(
+    @Req() request: UserRequest,
+    @Param('deviceId') deviceId: string,
+  ) {
+    return this.store.listConversationMessages(request.user.id, deviceId);
   }
 }

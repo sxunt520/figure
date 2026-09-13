@@ -9,7 +9,20 @@ export interface Character {
   description: string;
   accentColor: string;
   voiceId: string;
+  ttsModel: string;
   greeting: string;
+  prompt: string;
+  nfcTagUid: string | null;
+}
+
+export interface ConversationMessage {
+  id: string;
+  deviceId: string;
+  characterId: string;
+  role: 'user' | 'assistant';
+  content: string;
+  source: string;
+  createdAt: string;
 }
 
 export interface Device {
@@ -19,6 +32,13 @@ export interface Device {
   firmwareVersion: string;
   characterId: string | null;
   character: Character | null;
+  nfcTag: {
+    uid: string;
+    lastSeenAt: string;
+    matched: boolean;
+    characterId: string | null;
+    characterName: string | null;
+  } | null;
   status: 'online' | 'offline';
   lastSeenAt: string | null;
   volume: number;
@@ -30,6 +50,7 @@ export interface Reminder {
   title: string;
   scheduledAt: string;
   repeat: 'none' | 'daily';
+  kind: 'reminder' | 'alarm';
   enabled: boolean;
   lastTriggeredAt: string | null;
 }
@@ -38,6 +59,7 @@ export type CommandType =
   | 'sync_character'
   | 'play_reminder'
   | 'speak_text'
+  | 'start_listening'
   | 'set_volume';
 
 export interface DeviceCommand {

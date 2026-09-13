@@ -12,16 +12,18 @@ import {
   MaxLength,
   Min,
 } from 'class-validator';
-import { ReminderRepeat } from './contracts';
+import { ReminderKind, ReminderRepeat } from './contracts';
 
 export class BindDeviceDto {
   @IsString()
   @IsNotEmpty()
+  @MaxLength(64)
   pairingCode: string;
 
+  @IsOptional()
   @IsString()
-  @IsNotEmpty()
-  characterId: string;
+  @MaxLength(64)
+  characterId?: string;
 
   @IsOptional()
   @IsString()
@@ -33,6 +35,19 @@ export class UpdateCharacterDto {
   @IsString()
   @IsNotEmpty()
   characterId: string;
+}
+
+export class UpdateCharacterPromptDto {
+  @IsString()
+  @MaxLength(8000)
+  prompt: string;
+}
+
+export class BindCharacterNfcTagDto {
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(40)
+  uid: string;
 }
 
 export class UpdateDeviceNameDto {
@@ -66,6 +81,10 @@ export class CreateReminderDto {
   @IsOptional()
   @IsIn(['none', 'daily'])
   repeat?: ReminderRepeat;
+
+  @IsOptional()
+  @IsIn(['reminder', 'alarm'])
+  kind?: ReminderKind;
 }
 
 export class UpdateReminderDto {
@@ -81,6 +100,10 @@ export class UpdateReminderDto {
   @IsOptional()
   @IsIn(['none', 'daily'])
   repeat?: ReminderRepeat;
+
+  @IsOptional()
+  @IsIn(['reminder', 'alarm'])
+  kind?: ReminderKind;
 
   @IsOptional()
   @IsBoolean()

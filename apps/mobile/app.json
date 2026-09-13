@@ -1,21 +1,43 @@
 {
   "expo": {
-    "name": "手办伙伴",
-    "slug": "figure-companion-mvp",
+    "name": "屿宙AI手办",
+    "slug": "yuzhou-ai-figure",
+    "scheme": "yuzhouaifigure",
     "version": "0.1.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
     "splash": {
       "resizeMode": "contain",
-      "backgroundColor": "#F6F4FF"
+      "backgroundColor": "#FAF9F7"
     },
     "assetBundlePatterns": ["**/*"],
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "用于扫描屿宙智能底座二维码"
+        }
+      ]
+    ],
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.example.figurecompanion"
+      "bundleIdentifier": "com.yuzhou.aifigure",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "用于发现并配置屿宙AI手办智能底座",
+        "NSBluetoothPeripheralUsageDescription": "用于发现并配置屿宙AI手办智能底座",
+        "NSCameraUsageDescription": "用于扫描智能底座二维码"
+      }
     },
     "android": {
-      "package": "com.example.figurecompanion"
+      "package": "com.yuzhou.aifigure",
+      "usesCleartextTraffic": true,
+      "permissions": [
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.ACCESS_WIFI_STATE"
+      ]
     }
   }
 }

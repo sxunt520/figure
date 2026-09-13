@@ -43,6 +43,8 @@ coverage/
 .expo-shared/
 web-build/
 expo-env.d.ts
+apps/mobile/android/
+apps/mobile/ios/
 
 # ESP-IDF generated and machine-local files
 firmware/build/

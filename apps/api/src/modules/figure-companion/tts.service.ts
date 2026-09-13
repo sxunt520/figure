@@ -22,8 +22,39 @@ interface DashScopeResponse {
 export class TtsService {
   private readonly logger = new Logger(TtsService.name);
   private readonly cacheDirectory = resolve(process.cwd(), '.data', 'tts');
+  private readonly stageDirectionKeywords = [
+    '笑',
+    '轻笑',
+    '微笑',
+    '偷笑',
+    '苦笑',
+    '叹气',
+    '叹息',
+    '沉默',
+    '停顿',
+    '小声',
+    '低声',
+    '温柔',
+    '认真',
+    '眨眼',
+    '歪头',
+    '点头',
+    '摇头',
+    '脸红',
+    '害羞',
+    '撒娇',
+    '疑惑',
+    '惊讶',
+    '开心',
+    '委屈',
+    '抱抱',
+  ];
 
-  async synthesize(text: string, requestedVoiceId?: string | null) {
+  async synthesize(
+    text: string,
+    requestedVoiceId?: string | null,
+    requestedModel?: string | null,
+  ) {
     const apiKey = process.env.DASHSCOPE_API_KEY?.trim();
     if (!apiKey) {
       throw new ServiceUnavailableException(
@@ -34,8 +65,9 @@ export class TtsService {
     const endpoint =
       process.env.DASHSCOPE_TTS_ENDPOINT?.trim() ||
       'https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer';
-    const model =
-      process.env.DASHSCOPE_TTS_MODEL?.trim() || 'cosyvoice-v3-flash';
+    const defaultModel =
+      process.env.DASHSCOPE_TTS_MODEL?.trim() || 'cosyvoice-v3.5-plus';
+    const model = requestedModel?.trim() || defaultModel;
     const format = process.env.DASHSCOPE_TTS_FORMAT?.trim() || 'wav';
     const sampleRate = Number(process.env.DASHSCOPE_TTS_SAMPLE_RATE || 24000);
     const defaultVoice =
@@ -54,6 +86,8 @@ export class TtsService {
       throw new ServiceUnavailableException('DASHSCOPE_TTS_SAMPLE_RATE 配置无效');
     }
 
+    const spokenText = this.toSpokenText(text);
+
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60_000);
     let response: Response;
@@ -67,7 +101,7 @@ export class TtsService {
         body: JSON.stringify({
           model,
           input: {
-            text,
+            text: spokenText,
             voice,
             format,
             sample_rate: sampleRate,
@@ -120,16 +154,34 @@ export class TtsService {
     const fileName = `${randomUUID()}.wav`;
     await writeFile(resolve(this.cacheDirectory, fileName), audio);
     this.logger.log(
-      `TTS ready voice=${voice} bytes=${audio.length} requestId=${payload.request_id ?? 'unknown'}`,
+      `TTS ready model=${model} voice=${voice} bytes=${audio.length} requestId=${payload.request_id ?? 'unknown'}`,
     );
     return {
       audioPath: `/audio/${fileName}`,
       format: 'wav' as const,
       sampleRate,
       voice,
+      model,
+      text: spokenText,
       provider: 'aliyun-dashscope' as const,
       requestId: payload.request_id ?? null,
     };
+  }
+
+  private toSpokenText(text: string) {
+    const stripped = text
+      .replace(/[（(【\[]([^（）()【】\[\]]{1,24})[）)】\]]/g, (matched, inner) => {
+        const cue = String(inner).trim();
+        if (this.stageDirectionKeywords.some((keyword) => cue.includes(keyword))) {
+          return '';
+        }
+        return matched;
+      })
+      .replace(/\s+/g, ' ')
+      .replace(/\s*([，。！？、,.!?；;：:])\s*/g, '$1')
+      .trim();
+
+    return stripped || text.trim();
   }
 
   async readCachedAudio(fileName: string) {

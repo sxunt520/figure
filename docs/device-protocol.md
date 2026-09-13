@@ -54,7 +54,8 @@ GET /device/commands
 | `sync_character` | 更新角色与音色配置 | `character` |
 | `set_volume` | 调节输出音量 | `volume` |
 | `speak_text` | 下载并播报角色语音 | `text`, `voiceId`, `audioPath`, `audioFormat`, `sampleRate` |
-| `play_reminder` | 触发角色语音提醒 | `title`, `voiceId`, `audioPath`, `audioFormat`, `sampleRate` |
+| `play_reminder` | 触发闹钟或角色语音提醒 | `kind`, `title`, `voiceId`, `audioPath`, `audioFormat`, `sampleRate` |
+| `start_listening` | VAD 录音并提交短语音识别 | `durationMs`, `stopMode`, `sampleRate`, `format`, `source` |
 
 设备只有在执行成功或已经安全保存指令后才进行 ACK。
 
@@ -88,7 +89,78 @@ POST /device/events
 
 后续可增加 `wake_word_detected`、`playback_started`、`playback_finished`、`wifi_signal` 和错误信息。
 
-## 6. 文本对话联调
+RC522 读到或移除标签时上报规范化 UID（大写十六进制、无分隔符）：
+
+```json
+{
+  "type": "nfc_tag_present",
+  "payload": {
+    "uid": "3B03F16F",
+    "uidLength": 4,
+    "reader": "MFRC522"
+  }
+}
+```
+
+后端从 `figure_characters.nfcTagUid` 匹配角色。匹配成功且设备已绑定账号时，后端立即更新
+设备当前角色并生成 `sync_character` 指令；未匹配 UID 仍保存在事件表，供 APP 的 NFC
+角色绑定界面选择角色后写入 MySQL。同一个 UID 只能绑定一个角色。
+
+后端也会把当前放置状态同步到设备记录：
+
+- `nfc_tag_present`：写入 `lastNfcTagUid`、`lastNfcAt` 和匹配到的角色 ID。
+- `nfc_tag_removed`：清空当前 `lastNfcTagUid` 和匹配角色，但保留最后变更时间。
+- APP 绑定“当前已放置但未识别”的 UID 到某个角色后，后端会立即把底座当前角色切到该角色，
+  下发 `sync_character`，并生成一句角色欢迎语。
+
+APP 的设备视图会返回 `nfcTag`：
+
+```json
+{
+  "uid": "3B03F16F",
+  "lastSeenAt": "2026-09-13T10:00:00.000Z",
+  "matched": true,
+  "characterId": "suki",
+  "characterName": "Suki"
+}
+```
+
+## 6. 上传短语音
+
+APP 通过 `POST /devices/<deviceId>/listen` 下发 `start_listening`。设备进入
+`LISTENING` 后以 VAD 录音：检测到说话后遇到约 1 秒静音自动结束，约 4 秒内没有
+说话则结束，最大录音长度由 `durationMs` 限制（当前 APP 为 10 秒）。输出为
+16 kHz、16-bit、单声道 PCM WAV：
+
+```http
+POST /device/conversation/audio?commandId=<commandId>
+Authorization: Bearer <deviceAccessToken>
+Content-Type: audio/wav
+
+<WAV binary>
+```
+
+后端校验 WAV 后调用阿里云 NLS 一句话识别，响应包含 `text`、`taskId`、
+`durationMs` 和 `sampleRate`。同时写入 `speech_recognized` 或 `speech_empty`
+设备事件，APP 轮询事件列表显示最近识别结果。设备收到成功响应后再 ACK 指令。
+有识别文字时，后端异步执行角色对话，避免 MiniMax 和 TTS 耗时阻塞设备上传请求。
+
+对话服务读取设备当前绑定角色的 `prompt`，并携带相同用户、设备、角色下最近
+30 条消息调用 MiniMax。回复写入聊天记录后生成 CosyVoice WAV，并通过新的
+`speak_text` 指令让设备自动播放。
+
+实体按键调用同一个录音上传函数但省略 `commandId`；后端会将事件来源记为
+`device_button`。固件默认将常开瞬时按键配置为 `GPIO39 → 按键 → GND`。
+上传上限为 512 KB，当前最长 10 秒 WAV 大约 320 KB。
+
+## 7. 设备状态与显示
+
+固件状态为 `BOOTING`、`CONNECTING`、`IDLE`、`LISTENING`、`UPLOADING`、
+`THINKING`、`SPEAKING`、`REMINDER`、`ALARM` 和 `ERROR`。屏幕底部动画和 RGB
+都由状态机统一驱动；`play_reminder.payload.kind` 为 `alarm` 时显示红橙闪烁，
+否则显示主动提醒动画。异常状态约 5 秒自动恢复，等待 AI 回复超过约 90 秒也会回到空闲。
+
+## 8. 文本对话
 
 ```http
 POST /device/conversation/messages
@@ -100,4 +172,42 @@ POST /device/conversation/messages
 }
 ```
 
-当前返回模拟角色回复和 `audioUrl: null`。接入阿里云后，短期可以返回生成的音频 URL；实时语音阶段应升级为独立 WebSocket + Opus 流，不通过这个 JSON 接口传输大段 PCM 数据。
+该接口也使用正式的 MiniMax 角色对话和 CosyVoice TTS，并把用户消息、角色回复
+写入 MySQL。返回 `text`、`characterId`、`voiceId` 和 `audioUrl`，同时向设备
+队列写入 `speak_text`。
+
+APP 查询当前角色最近 30 条聊天记录：
+
+```http
+GET /devices/<deviceId>/messages
+Authorization: Bearer <appAccessToken>
+```
+
+实时语音阶段再升级为独立 WebSocket + Opus 流；当前 HTTP 半双工链路保留为
+稳定降级方案。
+
+## 9. BLE 配网与更换 Wi-Fi
+
+底座使用乐鑫 `network_provisioning` 的 BLE transport 和 Security 1。未保存 Wi-Fi
+时自动进入配网；已配网设备在正常启动后长按 BOOT（GPIO0）约 5 秒，重启后进入
+配网。BLE 广播名为 `YZAI_<MAC 后六位>`，APP 扫描的二维码结构如下：
+
+```json
+{
+  "ver": "v1",
+  "name": "YZAI_6B9A54",
+  "pop": "yuzhou-6055",
+  "transport": "ble",
+  "security": 1,
+  "hardwareId": "ESP32S3-DEMO-001",
+  "pairingCode": "FIGURE-0001"
+}
+```
+
+APP 从底座读取附近网络列表，再通过加密 BLE 发送所选 2.4 GHz SSID 和密码。
+配网成功只更新设备本地网络凭据；账户绑定、角色绑定、记忆和提醒继续由后端保存，
+因此更换 Wi-Fi 不等同于解绑。新增设备配网成功后，APP 使用 `pairingCode` 调用
+`POST /devices/bind` 自动认领；同一账号重复调用是幂等的，已属于其他账号时返回
+冲突。解绑调用 `DELETE /devices/<deviceId>/binding`，会停用该底座的旧提醒并删除
+未执行指令，聊天记录继续按原用户隔离保存。开发阶段使用共享 PoP 和认领码，量产
+时两者都改为不可预测的一机一码。

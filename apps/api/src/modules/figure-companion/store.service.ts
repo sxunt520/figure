@@ -10,7 +10,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { createHash, randomUUID } from 'crypto';
 import { IsNull, LessThanOrEqual, Repository } from 'typeorm';
-import { Character, DeviceView, User } from './contracts';
+import { Character, ConversationMessage, DeviceView, User } from './contracts';
 import {
   BindDeviceDto,
   CreateReminderDto,
@@ -21,6 +21,7 @@ import {
 } from './dto';
 import {
   CharacterEntity,
+  ConversationMessageEntity,
   DeviceCommandEntity,
   DeviceEntity,
   DeviceEventEntity,
@@ -29,6 +30,8 @@ import {
   UserEntity,
 } from './entities';
 import { TtsService } from './tts.service';
+import { AsrService } from './asr.service';
+import { AiChatService } from './ai-chat.service';
 
 @Injectable()
 export class StoreService implements OnModuleInit, OnModuleDestroy {
@@ -43,12 +46,15 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
   private reminderTimer?: NodeJS.Timeout;
   private reminderTickRunning = false;
   private readonly reminderRetryAfter = new Map<string, number>();
+  private readonly conversationChains = new Map<string, Promise<void>>();
 
   constructor(
     @InjectRepository(UserEntity)
     private readonly userRepository: Repository<UserEntity>,
     @InjectRepository(CharacterEntity)
     private readonly characterRepository: Repository<CharacterEntity>,
+    @InjectRepository(ConversationMessageEntity)
+    private readonly conversationRepository: Repository<ConversationMessageEntity>,
     @InjectRepository(DeviceEntity)
     private readonly deviceRepository: Repository<DeviceEntity>,
     @InjectRepository(DeviceSessionEntity)
@@ -60,6 +66,8 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     @InjectRepository(DeviceEventEntity)
     private readonly eventRepository: Repository<DeviceEventEntity>,
     private readonly tts: TtsService,
+    private readonly asr: AsrService,
+    private readonly aiChat: AiChatService,
   ) {}
 
   async onModuleInit() {
@@ -99,6 +107,71 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     return characters.map((item) => this.toCharacter(item));
   }
 
+  async updateCharacterPrompt(
+    userId: string,
+    characterId: string,
+    prompt: string,
+  ): Promise<Character> {
+    void userId;
+    const character = await this.requireCharacter(characterId);
+    character.prompt = prompt.trim();
+    return this.toCharacter(await this.characterRepository.save(character));
+  }
+
+  async bindCharacterNfcTag(
+    userId: string,
+    characterId: string,
+    rawUid: string,
+  ): Promise<Character> {
+    const [character, uid] = await Promise.all([
+      this.requireCharacter(characterId),
+      Promise.resolve(this.normalizeNfcUid(rawUid)),
+    ]);
+    const conflict = await this.characterRepository.findOne({
+      where: { nfcTagUid: uid },
+    });
+    if (conflict && conflict.id !== character.id) {
+      throw new ConflictException(`该标签已经绑定角色“${conflict.name}”`);
+    }
+    character.nfcTagUid = uid;
+    const saved = await this.characterRepository.save(character);
+
+    const activeDevices = await this.deviceRepository.find({
+      where: { ownerUserId: userId, lastNfcTagUid: uid },
+    });
+    for (const device of activeDevices) {
+      const switched = device.characterId !== saved.id;
+      device.characterId = saved.id;
+      device.lastNfcMatchedCharacterId = saved.id;
+      await this.deviceRepository.save(device);
+      if (switched) {
+        await this.commandRepository.delete({
+          deviceId: device.id,
+          type: 'sync_character',
+          acknowledgedAt: IsNull(),
+        });
+        await this.enqueueCommand(device.id, 'sync_character', {
+          character: this.toDeviceCharacter(saved),
+          source: 'nfc_bind',
+          nfcTagUid: uid,
+        });
+        void this.enqueueNfcWelcome(device.id, saved);
+      }
+    }
+
+    return this.toCharacter(saved);
+  }
+
+  async unbindCharacterNfcTag(
+    userId: string,
+    characterId: string,
+  ): Promise<Character> {
+    void userId;
+    const character = await this.requireCharacter(characterId);
+    character.nfcTagUid = null;
+    return this.toCharacter(await this.characterRepository.save(character));
+  }
+
   async listDevices(userId: string): Promise<DeviceView[]> {
     const devices = await this.deviceRepository.find({
       where: { ownerUserId: userId },
@@ -120,15 +193,42 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     if (device.ownerUserId && device.ownerUserId !== userId) {
       throw new ConflictException('该设备已经绑定其他账号');
     }
-    const character = await this.requireCharacter(dto.characterId);
+    const character = dto.characterId
+      ? await this.requireCharacter(dto.characterId)
+      : null;
     device.ownerUserId = userId;
-    device.characterId = character.id;
+    if (character) device.characterId = character.id;
     if (dto.name?.trim()) device.name = dto.name.trim();
     await this.deviceRepository.save(device);
-    await this.enqueueCommand(device.id, 'sync_character', {
-      character: this.toCharacter(character),
-    });
+    if (character) {
+      await this.enqueueCommand(device.id, 'sync_character', {
+        character: this.toDeviceCharacter(character),
+      });
+    }
     return this.toDeviceView(device, await this.characterRepository.find());
+  }
+
+  async unbindDevice(userId: string, deviceId: string) {
+    const device = await this.requireOwnedDevice(userId, deviceId);
+
+    // Old reminders and queued speech must never reach a future owner. Chat
+    // history remains scoped to the old user and is intentionally preserved.
+    await this.reminderRepository.update(
+      { userId, deviceId, enabled: true },
+      { enabled: false },
+    );
+    await this.commandRepository.delete({
+      deviceId,
+      acknowledgedAt: IsNull(),
+    });
+    device.ownerUserId = null;
+    device.characterId = null;
+    device.lastNfcTagUid = null;
+    device.lastNfcAt = null;
+    device.lastNfcMatchedCharacterId = null;
+    await this.deviceRepository.save(device);
+
+    return { unbound: true, deviceId };
   }
 
   async updateCharacter(userId: string, deviceId: string, characterId: string) {
@@ -139,7 +239,7 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     device.characterId = character.id;
     await this.deviceRepository.save(device);
     await this.enqueueCommand(device.id, 'sync_character', {
-      character: this.toCharacter(character),
+      character: this.toDeviceCharacter(character),
     });
     return this.toDeviceView(device, await this.characterRepository.find());
   }
@@ -166,7 +266,11 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     const character = device.characterId
       ? await this.requireCharacter(device.characterId)
       : null;
-    const speech = await this.tts.synthesize(text, character?.voiceId);
+    const speech = await this.tts.synthesize(
+      text,
+      character?.voiceId,
+      character?.ttsModel,
+    );
     return this.enqueueCommand(device.id, 'speak_text', {
       text,
       characterId: character?.id ?? null,
@@ -175,6 +279,27 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       audioFormat: speech.format,
       sampleRate: speech.sampleRate,
       provider: speech.provider,
+      ttsModel: speech.model,
+    });
+  }
+
+  async startListening(userId: string, deviceId: string) {
+    const device = await this.requireOwnedDevice(userId, deviceId);
+    const pending = await this.commandRepository.findOne({
+      where: {
+        deviceId: device.id,
+        type: 'start_listening',
+        acknowledgedAt: IsNull(),
+      },
+      order: { createdAt: 'DESC' },
+    });
+    if (pending) return pending;
+    return this.enqueueCommand(device.id, 'start_listening', {
+      durationMs: 10000,
+      sampleRate: 16000,
+      format: 'wav',
+      source: 'app',
+      stopMode: 'vad',
     });
   }
 
@@ -194,6 +319,24 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       order: { createdAt: 'DESC' },
       take: 20,
     });
+  }
+
+  async listConversationMessages(
+    userId: string,
+    deviceId: string,
+  ): Promise<ConversationMessage[]> {
+    const device = await this.requireOwnedDevice(userId, deviceId);
+    if (!device.characterId) return [];
+    const messages = await this.conversationRepository.find({
+      where: {
+        userId,
+        deviceId,
+        characterId: device.characterId,
+      },
+      order: { createdAt: 'DESC' },
+      take: 30,
+    });
+    return messages.reverse().map((message) => this.toConversationMessage(message));
   }
 
   listReminders(userId: string, deviceId?: string) {
@@ -216,6 +359,7 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
         title: dto.title.trim(),
         scheduledAt,
         repeat: dto.repeat ?? 'none',
+        kind: dto.kind ?? 'reminder',
         enabled: true,
         lastTriggeredAt: null,
       }),
@@ -230,6 +374,7 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       reminder.lastTriggeredAt = null;
     }
     if (dto.repeat !== undefined) reminder.repeat = dto.repeat;
+    if (dto.kind !== undefined) reminder.kind = dto.kind;
     if (dto.enabled !== undefined) reminder.enabled = dto.enabled;
     return this.reminderRepository.save(reminder);
   }
@@ -276,7 +421,7 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       serverTime: new Date().toISOString(),
       bound: Boolean(device.ownerUserId),
       characterId: device.characterId,
-      pendingCommandCount: (await this.getPendingCommands(device)).length,
+      pendingCommandCount: await this.countPendingCommands(device),
     };
   }
 
@@ -284,7 +429,13 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     return this.commandRepository.find({
       where: { deviceId: device.id, acknowledgedAt: IsNull() },
       order: { createdAt: 'ASC' },
-      take: 5,
+      take: 1,
+    });
+  }
+
+  countPendingCommands(device: DeviceEntity) {
+    return this.commandRepository.count({
+      where: { deviceId: device.id, acknowledgedAt: IsNull() },
     });
   }
 
@@ -304,34 +455,286 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     payload: Record<string, unknown> = {},
   ) {
     device.lastSeenAt = new Date();
-    const event = this.eventRepository.create({ deviceId: device.id, type, payload });
+    let eventPayload = payload;
+    let matchedCharacter: CharacterEntity | null = null;
+    let switched = false;
+
+    if (type === 'nfc_tag_present') {
+      if (typeof payload.uid !== 'string') {
+        throw new BadRequestException('NFC 事件缺少 uid');
+      }
+      const uid = this.normalizeNfcUid(payload.uid);
+      matchedCharacter = await this.characterRepository.findOne({
+        where: { nfcTagUid: uid },
+      });
+      if (matchedCharacter && device.ownerUserId) {
+        switched = device.characterId !== matchedCharacter.id;
+        if (switched) {
+          device.characterId = matchedCharacter.id;
+          // Keep only the newest physical selection when the device was offline.
+          await this.commandRepository.delete({
+            deviceId: device.id,
+            type: 'sync_character',
+            acknowledgedAt: IsNull(),
+          });
+          await this.enqueueCommand(device.id, 'sync_character', {
+            character: this.toDeviceCharacter(matchedCharacter),
+            source: 'nfc',
+            nfcTagUid: uid,
+          });
+        }
+      }
+      device.lastNfcTagUid = uid;
+      device.lastNfcAt = new Date();
+      device.lastNfcMatchedCharacterId = matchedCharacter?.id ?? null;
+      eventPayload = {
+        ...payload,
+        uid,
+        matched: Boolean(matchedCharacter),
+        characterId: matchedCharacter?.id ?? null,
+        characterName: matchedCharacter?.name ?? null,
+        switched,
+        deviceBound: Boolean(device.ownerUserId),
+      };
+    } else if (type === 'nfc_tag_removed') {
+      const uid =
+        typeof payload.uid === 'string'
+          ? this.normalizeNfcUid(payload.uid)
+          : device.lastNfcTagUid;
+      if (uid && device.lastNfcTagUid === uid) {
+        device.lastNfcTagUid = null;
+        device.lastNfcMatchedCharacterId = null;
+      }
+      device.lastNfcAt = new Date();
+      eventPayload = {
+        ...payload,
+        uid,
+        present: false,
+      };
+    }
+
+    const event = this.eventRepository.create({
+      deviceId: device.id,
+      type,
+      payload: eventPayload,
+    });
     const [, savedEvent] = await Promise.all([
       this.deviceRepository.save(device),
       this.eventRepository.save(event),
     ]);
+    if (type === 'nfc_tag_present' && switched && matchedCharacter) {
+      void this.enqueueNfcWelcome(device.id, matchedCharacter);
+    }
     return {
       accepted: true,
-      event: { type, payload, receivedAt: savedEvent.createdAt },
+      event: { type, payload: eventPayload, receivedAt: savedEvent.createdAt },
+      nfcMatch:
+        type === 'nfc_tag_present'
+          ? {
+              uid: eventPayload.uid,
+              characterId: matchedCharacter?.id ?? null,
+              characterName: matchedCharacter?.name ?? null,
+              switched,
+            }
+          : undefined,
+    };
+  }
+
+  async receiveDeviceRecording(
+    device: DeviceEntity,
+    commandId: string | undefined,
+    body: unknown,
+  ) {
+    if (!Buffer.isBuffer(body)) {
+      throw new BadRequestException('请求体必须是 WAV 二进制音频');
+    }
+    const normalizedCommandId = commandId?.trim() || null;
+    if (normalizedCommandId) {
+      const command = await this.commandRepository.findOne({
+        where: {
+          id: normalizedCommandId,
+          deviceId: device.id,
+          type: 'start_listening',
+        },
+      });
+      if (!command) {
+        throw new NotFoundException('录音指令不存在或不属于该设备');
+      }
+    }
+
+    const recognition = await this.asr.recognizeWav(body);
+    device.lastSeenAt = new Date();
+    const eventType = recognition.text ? 'speech_recognized' : 'speech_empty';
+    const event = this.eventRepository.create({
+      deviceId: device.id,
+      type: eventType,
+      payload: {
+        commandId: normalizedCommandId,
+        source: normalizedCommandId ? 'app' : 'device_button',
+        text: recognition.text,
+        provider: recognition.provider,
+        taskId: recognition.taskId,
+        durationMs: recognition.durationMs,
+        sampleRate: recognition.sampleRate,
+      },
+    });
+    await Promise.all([
+      this.deviceRepository.save(device),
+      this.eventRepository.save(event),
+    ]);
+    if (recognition.text) {
+      this.queueConversation(
+        device.id,
+        recognition.text,
+        normalizedCommandId ? 'app_voice' : 'device_button_voice',
+      );
+    }
+    return {
+      accepted: true,
+      commandId: normalizedCommandId,
+      ...recognition,
     };
   }
 
   async replyToDeviceMessage(device: DeviceEntity, dto: DeviceMessageDto) {
     device.lastSeenAt = new Date();
     await this.deviceRepository.save(device);
-    const character = device.characterId
-      ? await this.requireCharacter(device.characterId)
-      : null;
-    const reply = character
-      ? `${character.name}已收到：“${dto.text}”。目前这是联调回复，下一阶段会接入正式 AI 对话和阿里云角色音色。`
-      : `设备尚未绑定角色。收到：“${dto.text}”。`;
+    const result = await this.createConversationReply(
+      device.id,
+      dto.text.trim(),
+      'device_text',
+    );
     return {
       conversationId: `conversation-${device.id}`,
-      text: reply,
-      characterId: character?.id ?? null,
-      voiceId: character?.voiceId ?? null,
-      audioUrl: null,
-      provider: 'mock',
+      text: result.reply.content,
+      characterId: result.character.id,
+      voiceId: result.speech.voice,
+      audioUrl: result.speech.audioPath,
+      provider: result.reply.model,
     };
+  }
+
+  private queueConversation(deviceId: string, text: string, source: string) {
+    const previous = this.conversationChains.get(deviceId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          await this.createConversationReply(deviceId, text, source);
+        } catch (error) {
+          this.logger.error(
+            `Conversation failed device=${deviceId}: ${
+              error instanceof Error ? error.message : 'unknown error'
+            }`,
+          );
+          await this.eventRepository.save(
+            this.eventRepository.create({
+              deviceId,
+              type: 'conversation_failed',
+              payload: {
+                source,
+                message:
+                  error instanceof Error ? error.message : 'AI 对话处理失败',
+              },
+            }),
+          );
+        }
+      })
+      .finally(() => {
+        if (this.conversationChains.get(deviceId) === next) {
+          this.conversationChains.delete(deviceId);
+        }
+      });
+    this.conversationChains.set(deviceId, next);
+  }
+
+  private async createConversationReply(
+    deviceId: string,
+    text: string,
+    source: string,
+  ) {
+    const device = await this.deviceRepository.findOne({ where: { id: deviceId } });
+    if (!device?.ownerUserId) {
+      throw new BadRequestException('设备尚未绑定用户');
+    }
+    if (!device.characterId) {
+      throw new BadRequestException('设备尚未绑定角色');
+    }
+    const character = await this.requireCharacter(device.characterId);
+    const userMessage = await this.conversationRepository.save(
+      this.conversationRepository.create({
+        userId: device.ownerUserId,
+        deviceId: device.id,
+        characterId: character.id,
+        role: 'user',
+        content: text,
+        source,
+      }),
+    );
+    const recentMessages = await this.conversationRepository.find({
+      where: {
+        userId: device.ownerUserId,
+        deviceId: device.id,
+        characterId: character.id,
+      },
+      order: { createdAt: 'DESC' },
+      take: 30,
+    });
+    recentMessages.reverse();
+
+    const prompt =
+      character.prompt?.trim() ||
+      `你是${character.name}。${character.description}请始终以这个角色的身份，用自然、简短、适合语音播放的中文回答。`;
+    const reply = await this.aiChat.complete(
+      prompt,
+      recentMessages.map((message) => ({
+        role: message.role,
+        content: message.content,
+      })),
+    );
+    const speech = await this.tts.synthesize(
+      reply.content,
+      character.voiceId,
+      character.ttsModel,
+    );
+    const assistantMessage = await this.conversationRepository.save(
+      this.conversationRepository.create({
+        userId: device.ownerUserId,
+        deviceId: device.id,
+        characterId: character.id,
+        role: 'assistant',
+        content: reply.content,
+        source: 'minimax',
+      }),
+    );
+    const command = await this.enqueueCommand(device.id, 'speak_text', {
+      text: reply.content,
+      characterId: character.id,
+      voiceId: speech.voice,
+      audioPath: speech.audioPath,
+      audioFormat: speech.format,
+      sampleRate: speech.sampleRate,
+      provider: speech.provider,
+      ttsModel: speech.model,
+      aiModel: reply.model,
+      conversationMessageId: assistantMessage.id,
+      source: 'ai_conversation',
+    });
+    await this.eventRepository.save(
+      this.eventRepository.create({
+        deviceId: device.id,
+        type: 'conversation_reply_ready',
+        payload: {
+          source,
+          userMessageId: userMessage.id,
+          assistantMessageId: assistantMessage.id,
+          commandId: command.id,
+          text: reply.content,
+          model: reply.model,
+        },
+      }),
+    );
+    return { character, reply, speech, command };
   }
 
   private enqueueCommand(
@@ -347,6 +750,46 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
         acknowledgedAt: null,
       }),
     );
+  }
+
+  private async enqueueNfcWelcome(
+    deviceId: string,
+    character: CharacterEntity,
+  ) {
+    const text = `Hello，我是${character.name}，接下来由我陪伴你`;
+    try {
+      const speech = await this.tts.synthesize(
+        text,
+        character.voiceId,
+        character.ttsModel,
+      );
+      const currentDevice = await this.deviceRepository.findOne({
+        where: { id: deviceId },
+      });
+      if (currentDevice?.characterId !== character.id) {
+        this.logger.log(
+          `Skipping stale NFC welcome device=${deviceId} character=${character.id}`,
+        );
+        return;
+      }
+      await this.enqueueCommand(deviceId, 'speak_text', {
+        text,
+        characterId: character.id,
+        voiceId: speech.voice,
+        audioPath: speech.audioPath,
+        audioFormat: speech.format,
+        sampleRate: speech.sampleRate,
+        provider: speech.provider,
+        ttsModel: speech.model,
+        source: 'nfc_welcome',
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Unable to prepare NFC welcome device=${deviceId} character=${character.id}: ${
+          error instanceof Error ? error.message : 'unknown error'
+        }`,
+      );
+    }
   }
 
   private async triggerDueReminders() {
@@ -368,18 +811,23 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
           : null;
         try {
           const speech = await this.tts.synthesize(
-            `提醒时间到了，${reminder.title}`,
+            reminder.kind === 'alarm'
+              ? `起床时间到了，${reminder.title}`
+              : `提醒一下，${reminder.title}`,
             character?.voiceId,
+            character?.ttsModel,
           );
-          await this.enqueueCommand(device.id, 'play_reminder', {
+          const command = await this.enqueueCommand(device.id, 'play_reminder', {
             reminderId: reminder.id,
             title: reminder.title,
+            kind: reminder.kind,
             characterId: character?.id ?? null,
             voiceId: speech.voice,
             audioPath: speech.audioPath,
             audioFormat: speech.format,
             sampleRate: speech.sampleRate,
             provider: speech.provider,
+            ttsModel: speech.model,
           });
           reminder.lastTriggeredAt = now;
           if (reminder.repeat === 'daily') {
@@ -391,6 +839,18 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
             reminder.enabled = false;
           }
           await this.reminderRepository.save(reminder);
+          await this.eventRepository.save(
+            this.eventRepository.create({
+              deviceId: device.id,
+              type: 'reminder_triggered',
+              payload: {
+                reminderId: reminder.id,
+                title: reminder.title,
+                kind: reminder.kind,
+                commandId: command.id,
+              },
+            }),
+          );
           this.reminderRetryAfter.delete(reminder.id);
         } catch (error) {
           this.reminderRetryAfter.set(reminder.id, Date.now() + 30_000);
@@ -435,7 +895,36 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       description: character.description,
       accentColor: character.accentColor,
       voiceId: character.voiceId,
+      ttsModel: character.ttsModel,
       greeting: character.greeting,
+      prompt: character.prompt ?? '',
+      nfcTagUid: character.nfcTagUid ?? null,
+    };
+  }
+
+  private toDeviceCharacter(character: CharacterEntity) {
+    return {
+      id: character.id,
+      name: character.name,
+      description: character.description,
+      accentColor: character.accentColor,
+      voiceId: character.voiceId,
+      ttsModel: character.ttsModel,
+      greeting: character.greeting,
+    };
+  }
+
+  private toConversationMessage(
+    message: ConversationMessageEntity,
+  ): ConversationMessage {
+    return {
+      id: message.id,
+      deviceId: message.deviceId,
+      characterId: message.characterId,
+      role: message.role,
+      content: message.content,
+      source: message.source,
+      createdAt: message.createdAt.toISOString(),
     };
   }
 
@@ -447,6 +936,10 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       device.lastSeenAt !== null &&
       Date.now() - device.lastSeenAt.getTime() < onlineWindowSeconds * 1000;
     const character = characters.find((item) => item.id === device.characterId) ?? null;
+    const nfcCharacter =
+      device.lastNfcMatchedCharacterId === null
+        ? null
+        : characters.find((item) => item.id === device.lastNfcMatchedCharacterId) ?? null;
     return {
       id: device.id,
       hardwareId: device.hardwareId,
@@ -454,6 +947,16 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       firmwareVersion: device.firmwareVersion,
       characterId: device.characterId,
       character: character ? this.toCharacter(character) : null,
+      nfcTag:
+        device.lastNfcTagUid && device.lastNfcAt
+          ? {
+              uid: device.lastNfcTagUid,
+              lastSeenAt: device.lastNfcAt.toISOString(),
+              matched: Boolean(nfcCharacter),
+              characterId: nfcCharacter?.id ?? null,
+              characterName: nfcCharacter?.name ?? null,
+            }
+          : null,
       status: isOnline ? 'online' : 'offline',
       lastSeenAt: device.lastSeenAt?.toISOString() ?? null,
       volume: device.volume,
@@ -465,36 +968,19 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       { id: this.demoUser.id, displayName: this.demoUser.displayName },
       ['id'],
     );
-    const characterSeeds: Array<Partial<CharacterEntity> & Pick<CharacterEntity, 'id'>> = [
-      {
-        id: 'character-xiaoyu',
-        name: '小羽',
-        description: '温柔、活泼，适合作为日常陪伴角色。',
-        accentColor: '#8B5CF6',
-        voiceId: 'aliyun-voice-placeholder-xiaoyu',
-        greeting: '你回来啦，今天过得怎么样？',
-      },
-      {
-        id: 'character-captain',
-        name: '队长',
-        description: '干练可靠，适合提醒、计划和早起任务。',
-        accentColor: '#0EA5E9',
-        voiceId: 'aliyun-voice-placeholder-captain',
-        greeting: '状态确认完毕，今天也一起完成计划吧。',
-      },
-      {
-        id: 'character-momo',
-        name: '默默',
-        description: '安静治愈，偏简短、不打扰的陪伴方式。',
-        accentColor: '#F97316',
-        voiceId: 'aliyun-voice-placeholder-momo',
-        greeting: '我在这里，想说什么都可以。',
-      },
-    ];
+    const characterSeeds: Array<Partial<CharacterEntity> & Pick<CharacterEntity, 'id'>> = [];
     for (const seed of characterSeeds) {
       const exists = await this.characterRepository.exist({ where: { id: seed.id } });
       if (!exists) {
         await this.characterRepository.save(this.characterRepository.create(seed));
+      } else {
+        const character = await this.characterRepository.findOne({
+          where: { id: seed.id },
+        });
+        if (character && !character.prompt?.trim() && seed.prompt) {
+          character.prompt = seed.prompt;
+          await this.characterRepository.save(character);
+        }
       }
     }
     const deviceExists = await this.deviceRepository.exist({
@@ -511,6 +997,9 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
           ownerUserId: null,
           characterId: null,
           lastSeenAt: null,
+          lastNfcTagUid: null,
+          lastNfcAt: null,
+          lastNfcMatchedCharacterId: null,
           volume: 60,
         }),
       );
@@ -519,5 +1008,13 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
 
   private hash(value: string): string {
     return createHash('sha256').update(value).digest('hex');
+  }
+
+  private normalizeNfcUid(value: string): string {
+    const uid = value.trim().toUpperCase().replace(/[\s:-]/g, '');
+    if (!/^[0-9A-F]+$/.test(uid) || ![8, 14, 20].includes(uid.length)) {
+      throw new BadRequestException('NFC UID 必须是 4、7 或 10 字节十六进制');
+    }
+    return uid;
   }
 }

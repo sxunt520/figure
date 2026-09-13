@@ -4,6 +4,7 @@ import {
   Get,
   Param,
   Post,
+  Query,
   Req,
   UseGuards,
 } from '@nestjs/common';
@@ -62,5 +63,18 @@ export class HardwareController {
     @Body() dto: DeviceMessageDto,
   ) {
     return this.store.replyToDeviceMessage(request.device, dto);
+  }
+
+  @Post('conversation/audio')
+  @UseGuards(DeviceAuthGuard)
+  uploadRecording(
+    @Req() request: DeviceRequest,
+    @Query('commandId') commandId: string,
+  ) {
+    return this.store.receiveDeviceRecording(
+      request.device,
+      commandId,
+      request.body as unknown,
+    );
   }
 }

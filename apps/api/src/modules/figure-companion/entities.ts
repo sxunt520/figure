@@ -7,7 +7,7 @@ import {
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
-import { CommandType, ReminderRepeat } from './contracts';
+import { CommandType, ReminderKind, ReminderRepeat } from './contracts';
 
 @Entity('figure_users')
 export class UserEntity {
@@ -38,14 +38,55 @@ export class CharacterEntity {
   @Column({ type: 'varchar', length: 160 })
   voiceId: string;
 
+  @Column({ type: 'varchar', length: 80, default: 'cosyvoice-v3.5-plus' })
+  ttsModel: string;
+
   @Column({ type: 'varchar', length: 500 })
   greeting: string;
+
+  // Nullable keeps schema synchronization compatible with existing MariaDB rows.
+  @Column({ type: 'text', nullable: true })
+  prompt: string | null;
+
+  // A physical figure is currently identified by one ISO 14443-A tag UID.
+  // Store the canonical uppercase hex value without separators (4/7/10 bytes).
+  @Index({ unique: true })
+  @Column({ type: 'varchar', length: 20, nullable: true })
+  nfcTagUid: string | null;
 
   @CreateDateColumn({ type: 'datetime', precision: 3 })
   createdAt: Date;
 
   @UpdateDateColumn({ type: 'datetime', precision: 3 })
   updatedAt: Date;
+}
+
+@Entity('figure_conversation_messages')
+@Index(['userId', 'deviceId', 'characterId', 'createdAt'])
+export class ConversationMessageEntity {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column({ type: 'varchar', length: 64 })
+  userId: string;
+
+  @Column({ type: 'char', length: 36 })
+  deviceId: string;
+
+  @Column({ type: 'varchar', length: 64 })
+  characterId: string;
+
+  @Column({ type: 'enum', enum: ['user', 'assistant'] })
+  role: 'user' | 'assistant';
+
+  @Column({ type: 'text' })
+  content: string;
+
+  @Column({ type: 'varchar', length: 32, default: 'voice' })
+  source: string;
+
+  @CreateDateColumn({ type: 'datetime', precision: 3 })
+  createdAt: Date;
 }
 
 @Entity('figure_devices')
@@ -82,6 +123,15 @@ export class DeviceEntity {
 
   @Column({ type: 'tinyint', unsigned: true, default: 60 })
   volume: number;
+
+  @Column({ type: 'varchar', length: 20, nullable: true })
+  lastNfcTagUid: string | null;
+
+  @Column({ type: 'datetime', precision: 3, nullable: true })
+  lastNfcAt: Date | null;
+
+  @Column({ type: 'varchar', length: 64, nullable: true })
+  lastNfcMatchedCharacterId: string | null;
 
   @CreateDateColumn({ type: 'datetime', precision: 3 })
   createdAt: Date;
@@ -133,6 +183,9 @@ export class ReminderEntity {
   @Column({ type: 'enum', enum: ['none', 'daily'], default: 'none' })
   repeat: ReminderRepeat;
 
+  @Column({ type: 'varchar', length: 16, default: 'reminder' })
+  kind: ReminderKind;
+
   @Index()
   @Column({ type: 'boolean', default: true })
   enabled: boolean;
@@ -158,7 +211,13 @@ export class DeviceCommandEntity {
 
   @Column({
     type: 'enum',
-    enum: ['sync_character', 'play_reminder', 'speak_text', 'set_volume'],
+    enum: [
+      'sync_character',
+      'play_reminder',
+      'speak_text',
+      'start_listening',
+      'set_volume',
+    ],
   })
   type: CommandType;
 
@@ -196,6 +255,7 @@ export class DeviceEventEntity {
 export const databaseEntities = [
   UserEntity,
   CharacterEntity,
+  ConversationMessageEntity,
   DeviceEntity,
   DeviceSessionEntity,
   ReminderEntity,

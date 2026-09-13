@@ -1,9 +1,11 @@
 export type DeviceStatus = 'online' | 'offline';
 export type ReminderRepeat = 'none' | 'daily';
+export type ReminderKind = 'reminder' | 'alarm';
 export type CommandType =
   | 'sync_character'
   | 'play_reminder'
   | 'speak_text'
+  | 'start_listening'
   | 'set_volume';
 
 export interface User {
@@ -17,7 +19,20 @@ export interface Character {
   description: string;
   accentColor: string;
   voiceId: string;
+  ttsModel: string;
   greeting: string;
+  prompt: string;
+  nfcTagUid: string | null;
+}
+
+export interface ConversationMessage {
+  id: string;
+  deviceId: string;
+  characterId: string;
+  role: 'user' | 'assistant';
+  content: string;
+  source: string;
+  createdAt: string;
 }
 
 export interface DeviceRecord {
@@ -40,6 +55,13 @@ export interface DeviceView {
   firmwareVersion: string;
   characterId: string | null;
   character: Character | null;
+  nfcTag: {
+    uid: string;
+    lastSeenAt: string;
+    matched: boolean;
+    characterId: string | null;
+    characterName: string | null;
+  } | null;
   status: DeviceStatus;
   lastSeenAt: string | null;
   volume: number;
@@ -52,6 +74,7 @@ export interface Reminder {
   title: string;
   scheduledAt: string;
   repeat: ReminderRepeat;
+  kind: ReminderKind;
   enabled: boolean;
   lastTriggeredAt: string | null;
 }

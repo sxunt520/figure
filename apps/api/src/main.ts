@@ -1,11 +1,16 @@
 import 'reflect-metadata';
 import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import { raw } from 'express';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   app.setGlobalPrefix('v1');
+  app.use(
+    '/v1/device/conversation/audio',
+    raw({ type: ['audio/wav', 'application/octet-stream'], limit: '512kb' }),
+  );
   app.enableCors({ origin: true, credentials: true });
   app.useGlobalPipes(
     new ValidationPipe({
