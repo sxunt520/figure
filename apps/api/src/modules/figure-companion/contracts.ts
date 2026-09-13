@@ -79,6 +79,55 @@ export interface Reminder {
   lastTriggeredAt: string | null;
 }
 
+export interface Alarm {
+  id: string;
+  deviceId: string;
+  hour: number;
+  minute: number;
+  days: number[];
+  enabled: boolean;
+  snoozeEnabled: boolean;
+  snoozeMinutes: number;
+  snoozeCount: number;
+  themeId: string;
+  useThemeSound: boolean;
+  soundTitle: string;
+  soundId: string | null;
+  timezone: string;
+  nextTriggeredAt: string | null;
+  snoozeScheduledAt: string | null;
+  snoozeUsedCount: number;
+  lifecycleStatus: 'scheduled' | 'ringing' | 'snoozing';
+  ringingStartedAt: string | null;
+  lastDismissedAt: string | null;
+  lastTriggeredAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type AlarmSoundKind = 'recording' | 'diy';
+export type AlarmSoundStatus = 'ready' | 'processing' | 'failed';
+
+export interface AlarmSound {
+  id: string;
+  title: string;
+  kind: AlarmSoundKind;
+  status: AlarmSoundStatus;
+  sourceName: string;
+  sourceMimeType: string;
+  sourceObjectKey: string;
+  sourceUrl: string;
+  outputObjectKey: string | null;
+  outputUrl: string | null;
+  text: string | null;
+  voiceId: string | null;
+  ttsModel: string | null;
+  backgroundMusicId: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface DeviceCommand {
   id: string;
   deviceId: string;

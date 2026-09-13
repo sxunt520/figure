@@ -12,6 +12,9 @@ import { TtsService } from './tts.service';
 import { AudioController } from './audio.controller';
 import { AsrService } from './asr.service';
 import { AiChatService } from './ai-chat.service';
+import { AlarmsController } from './alarms.controller';
+import { AlarmSoundsController } from './alarm-sounds.controller';
+import { AlarmSoundService } from './alarm-sound.service';
 
 @Module({
   imports: [TypeOrmModule.forFeature(databaseEntities)],
@@ -20,6 +23,8 @@ import { AiChatService } from './ai-chat.service';
     CharactersController,
     DevicesController,
     RemindersController,
+    AlarmsController,
+    AlarmSoundsController,
     HardwareController,
     AudioController,
   ],
@@ -28,6 +33,7 @@ import { AiChatService } from './ai-chat.service';
     TtsService,
     AsrService,
     AiChatService,
+    AlarmSoundService,
     UserAuthGuard,
     DeviceAuthGuard,
   ],

@@ -7,7 +7,13 @@ import {
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
-import { CommandType, ReminderKind, ReminderRepeat } from './contracts';
+import {
+  AlarmSoundKind,
+  AlarmSoundStatus,
+  CommandType,
+  ReminderKind,
+  ReminderRepeat,
+} from './contracts';
 
 @Entity('figure_users')
 export class UserEntity {
@@ -200,6 +206,156 @@ export class ReminderEntity {
   updatedAt: Date;
 }
 
+@Entity('figure_alarms')
+@Index(['userId', 'deviceId'])
+export class AlarmEntity {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Index()
+  @Column({ type: 'varchar', length: 64 })
+  userId: string;
+
+  @Index()
+  @Column({ type: 'char', length: 36 })
+  deviceId: string;
+
+  @Column({ type: 'tinyint', unsigned: true })
+  hour: number;
+
+  @Column({ type: 'tinyint', unsigned: true })
+  minute: number;
+
+  // MariaDB 10.1 has no native JSON column. Values are weekday numbers 0-6.
+  @Column({ type: 'simple-json' })
+  days: number[];
+
+  @Index()
+  @Column({ type: 'boolean', default: true })
+  enabled: boolean;
+
+  @Column({ type: 'boolean', default: true })
+  snoozeEnabled: boolean;
+
+  @Column({ type: 'tinyint', unsigned: true, default: 5 })
+  snoozeMinutes: number;
+
+  // Zero means unlimited snoozes.
+  @Column({ type: 'tinyint', unsigned: true, default: 3 })
+  snoozeCount: number;
+
+  @Column({ type: 'varchar', length: 64, default: 'suki-morning' })
+  themeId: string;
+
+  @Column({ type: 'boolean', default: true })
+  useThemeSound: boolean;
+
+  @Column({ type: 'varchar', length: 120 })
+  soundTitle: string;
+
+  @Column({ type: 'char', length: 36, nullable: true })
+  soundId: string | null;
+
+  @Column({ type: 'varchar', length: 64, default: 'Asia/Shanghai' })
+  timezone: string;
+
+  @Index()
+  @Column({ type: 'datetime', precision: 3, nullable: true })
+  nextTriggeredAt: Date | null;
+
+  @Index()
+  @Column({ type: 'datetime', precision: 3, nullable: true })
+  snoozeScheduledAt: Date | null;
+
+  @Column({ type: 'tinyint', unsigned: true, default: 0 })
+  snoozeUsedCount: number;
+
+  @Index()
+  @Column({ type: 'varchar', length: 16, default: 'scheduled' })
+  lifecycleStatus: 'scheduled' | 'ringing' | 'snoozing';
+
+  @Column({ type: 'datetime', precision: 3, nullable: true })
+  ringingStartedAt: Date | null;
+
+  @Column({ type: 'datetime', precision: 3, nullable: true })
+  lastDismissedAt: Date | null;
+
+  @Column({ type: 'datetime', precision: 3, nullable: true })
+  lastTriggeredAt: Date | null;
+
+  @CreateDateColumn({ type: 'datetime', precision: 3 })
+  createdAt: Date;
+
+  @UpdateDateColumn({ type: 'datetime', precision: 3 })
+  updatedAt: Date;
+}
+
+@Entity('figure_alarm_sounds')
+@Index(['userId', 'kind'])
+export class AlarmSoundEntity {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Index()
+  @Column({ type: 'varchar', length: 64 })
+  userId: string;
+
+  @Column({ type: 'varchar', length: 120 })
+  title: string;
+
+  @Column({ type: 'varchar', length: 16 })
+  kind: AlarmSoundKind;
+
+  @Index()
+  @Column({ type: 'varchar', length: 16, default: 'ready' })
+  status: AlarmSoundStatus;
+
+  @Column({ type: 'varchar', length: 180 })
+  sourceName: string;
+
+  @Column({ type: 'varchar', length: 80 })
+  sourceMimeType: string;
+
+  @Column({ type: 'varchar', length: 255 })
+  sourceObjectKey: string;
+
+  @Column({ type: 'text' })
+  sourceUrl: string;
+
+  @Column({ type: 'varchar', length: 255, nullable: true })
+  outputObjectKey: string | null;
+
+  @Column({ type: 'text', nullable: true })
+  outputUrl: string | null;
+
+  @Column({ type: 'varchar', length: 180 })
+  localFileName: string;
+
+  @Column({ type: 'varchar', length: 180, nullable: true })
+  sourceLocalFileName: string | null;
+
+  @Column({ type: 'varchar', length: 1000, nullable: true })
+  text: string | null;
+
+  @Column({ type: 'varchar', length: 160, nullable: true })
+  voiceId: string | null;
+
+  @Column({ type: 'varchar', length: 80, nullable: true })
+  ttsModel: string | null;
+
+  @Column({ type: 'varchar', length: 40, nullable: true })
+  backgroundMusicId: string | null;
+
+  @Column({ type: 'varchar', length: 500, nullable: true })
+  errorMessage: string | null;
+
+  @CreateDateColumn({ type: 'datetime', precision: 3 })
+  createdAt: Date;
+
+  @UpdateDateColumn({ type: 'datetime', precision: 3 })
+  updatedAt: Date;
+}
+
 @Entity('figure_device_commands')
 export class DeviceCommandEntity {
   @PrimaryGeneratedColumn('uuid')
@@ -259,6 +415,8 @@ export const databaseEntities = [
   DeviceEntity,
   DeviceSessionEntity,
   ReminderEntity,
+  AlarmEntity,
+  AlarmSoundEntity,
   DeviceCommandEntity,
   DeviceEventEntity,
 ];

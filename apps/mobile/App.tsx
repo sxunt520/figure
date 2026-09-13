@@ -15,6 +15,7 @@ import {
 } from 'react-native';
 import { API_BASE_URL, api } from './src/api';
 import { FigureFlow } from './src/screens/FigureFlow';
+import { AlarmFlow } from './src/screens/AlarmFlow';
 import { palette } from './src/theme';
 import {
   Character,
@@ -28,6 +29,7 @@ import {
 
 type RootTabParamList = {
   AI手办: undefined;
+  AI闹钟: undefined;
   设备: undefined;
   绑定: undefined;
   提醒: undefined;
@@ -36,6 +38,7 @@ type RootTabParamList = {
 const Tabs = createBottomTabNavigator<RootTabParamList>();
 const tabIcons: Record<keyof RootTabParamList, string> = {
   AI手办: '◉',
+  AI闹钟: '◷',
   设备: '⌁',
   绑定: '⌘',
   提醒: '◷',
@@ -139,7 +142,9 @@ export default function App() {
         initialRouteName="AI手办"
         screenOptions={({ route }) => {
           const nestedRoute = getFocusedRouteNameFromRoute(route);
-          const hideTabBar = route.name === 'AI手办' && nestedRoute != null && nestedRoute !== 'FigureHome';
+          const hideTabBar =
+            (route.name === 'AI手办' && nestedRoute != null && nestedRoute !== 'FigureHome') ||
+            (route.name === 'AI闹钟' && nestedRoute != null && nestedRoute !== 'AlarmHome');
           return {
             headerShown: false,
             tabBarActiveTintColor: palette.primaryDark,
@@ -163,6 +168,9 @@ export default function App() {
       >
         <Tabs.Screen name="AI手办">
           {() => <FigureFlow device={device} token={token} onDeviceChanged={refresh} />}
+        </Tabs.Screen>
+        <Tabs.Screen name="AI闹钟">
+          {() => <AlarmFlow token={token} device={device} />}
         </Tabs.Screen>
         <Tabs.Screen name="设备">
           {({ navigation }) => (

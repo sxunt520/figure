@@ -17,6 +17,12 @@
         {
           "cameraPermission": "用于扫描屿宙智能底座二维码"
         }
+      ],
+      [
+        "expo-av",
+        {
+          "microphonePermission": "用于录制并制作屿宙AI手办的自定义闹铃"
+        }
       ]
     ],
     "ios": {
@@ -25,7 +31,8 @@
       "infoPlist": {
         "NSBluetoothAlwaysUsageDescription": "用于发现并配置屿宙AI手办智能底座",
         "NSBluetoothPeripheralUsageDescription": "用于发现并配置屿宙AI手办智能底座",
-        "NSCameraUsageDescription": "用于扫描智能底座二维码"
+        "NSCameraUsageDescription": "用于扫描智能底座二维码",
+        "NSMicrophoneUsageDescription": "用于录制并制作屿宙AI手办的自定义闹铃"
       }
     },
     "android": {
@@ -36,7 +43,8 @@
         "android.permission.BLUETOOTH_CONNECT",
         "android.permission.ACCESS_FINE_LOCATION",
         "android.permission.ACCESS_NETWORK_STATE",
-        "android.permission.ACCESS_WIFI_STATE"
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.RECORD_AUDIO"
       ]
     }
   }

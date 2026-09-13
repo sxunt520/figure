@@ -12,6 +12,7 @@ interface DashScopeResponse {
   output?: {
     audio?: { url?: string; expires_at?: number };
     url?: string;
+    voice_id?: string;
   };
   request_id?: string;
   code?: string;
@@ -49,6 +50,75 @@ export class TtsService {
     '委屈',
     '抱抱',
   ];
+
+  async cloneVoice(
+    audioUrl: string,
+    requestedPrefix: string,
+    requestedModel = 'cosyvoice-v3.5-plus',
+  ) {
+    const apiKey = process.env.DASHSCOPE_API_KEY?.trim();
+    if (!apiKey) {
+      throw new ServiceUnavailableException(
+        '尚未配置 DASHSCOPE_API_KEY，无法复刻音色',
+      );
+    }
+    const endpoint =
+      process.env.DASHSCOPE_VOICE_ENROLLMENT_ENDPOINT?.trim() ||
+      'https://dashscope.aliyuncs.com/api/v1/services/audio/tts/customization';
+    const model = requestedModel.trim() || 'cosyvoice-v3.5-plus';
+    const prefix = requestedPrefix
+      .replace(/[^a-zA-Z0-9]/g, '')
+      .slice(0, 10) || 'alarm';
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 90_000);
+    let response: Response;
+    try {
+      response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${apiKey}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'voice-enrollment',
+          input: {
+            action: 'create_voice',
+            target_model: model,
+            prefix,
+            url: audioUrl,
+            language_hints: ['zh'],
+            max_prompt_audio_length: 20,
+            enable_volume_normalization: 'true',
+          },
+        }),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      throw new ServiceUnavailableException(
+        `连接阿里云音色复刻服务失败：${error instanceof Error ? error.message : '未知错误'}`,
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    const payload = (await response.json().catch(() => ({}))) as DashScopeResponse;
+    if (!response.ok || !payload.output?.voice_id) {
+      this.logger.error(
+        `DashScope voice cloning failed status=${response.status} requestId=${payload.request_id ?? 'unknown'} code=${payload.code ?? 'unknown'}`,
+      );
+      throw new ServiceUnavailableException(
+        `阿里云音色复刻失败：${payload.message || payload.code || response.status}`,
+      );
+    }
+    this.logger.log(
+      `Voice cloned model=${model} voice=${payload.output.voice_id} requestId=${payload.request_id ?? 'unknown'}`,
+    );
+    return {
+      voiceId: payload.output.voice_id,
+      model,
+      requestId: payload.request_id ?? null,
+    };
+  }
 
   async synthesize(
     text: string,

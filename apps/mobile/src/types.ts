@@ -55,6 +55,52 @@ export interface Reminder {
   lastTriggeredAt: string | null;
 }
 
+export interface Alarm {
+  id: string;
+  deviceId: string;
+  hour: number;
+  minute: number;
+  days: number[];
+  enabled: boolean;
+  snoozeEnabled: boolean;
+  snoozeMinutes: number;
+  snoozeCount: number;
+  themeId: string;
+  useThemeSound: boolean;
+  soundTitle: string;
+  soundId: string | null;
+  timezone: string;
+  nextTriggeredAt: string | null;
+  snoozeScheduledAt: string | null;
+  snoozeUsedCount: number;
+  lifecycleStatus: 'scheduled' | 'ringing' | 'snoozing';
+  ringingStartedAt: string | null;
+  lastDismissedAt: string | null;
+  lastTriggeredAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AlarmSound {
+  id: string;
+  title: string;
+  kind: 'recording' | 'diy';
+  status: 'ready' | 'processing' | 'failed';
+  sourceName: string;
+  sourceMimeType: string;
+  sourceObjectKey: string;
+  sourceUrl: string;
+  outputObjectKey: string | null;
+  outputUrl: string | null;
+  text: string | null;
+  voiceId: string | null;
+  ttsModel: string | null;
+  backgroundMusicId: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type CommandType =
   | 'sync_character'
   | 'play_reminder'

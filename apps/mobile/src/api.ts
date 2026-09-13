@@ -1,4 +1,6 @@
 import {
+  Alarm,
+  AlarmSound,
   Character,
   ConversationMessage,
   Device,
@@ -7,6 +9,23 @@ import {
   LoginResponse,
   Reminder,
 } from './types';
+
+export type AlarmInput = Pick<
+  Alarm,
+  | 'deviceId'
+  | 'hour'
+  | 'minute'
+  | 'days'
+  | 'enabled'
+  | 'snoozeEnabled'
+  | 'snoozeMinutes'
+  | 'snoozeCount'
+  | 'themeId'
+  | 'useThemeSound'
+  | 'soundTitle'
+  | 'soundId'
+  | 'timezone'
+>;
 
 function normalizeApiBaseUrl(value?: string) {
   const raw = value?.trim() || 'http://192.168.18.225:3000';
@@ -28,10 +47,11 @@ async function request<T>(
   const url = `${API_BASE_URL}${path}`;
   let response: Response;
   try {
+    const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
     response = await fetch(url, {
       ...options,
       headers: {
-        'content-type': 'application/json',
+        ...(!isFormData ? { 'content-type': 'application/json' } : {}),
         ...(token ? { authorization: `Bearer ${token}` } : {}),
         ...(options.headers ?? {}),
       },
@@ -180,4 +200,89 @@ export const api = {
       { method: 'DELETE' },
       token,
     ),
+
+  listAlarms: (token: string, deviceId: string) =>
+    request<Alarm[]>(
+      `/alarms?deviceId=${encodeURIComponent(deviceId)}`,
+      {},
+      token,
+    ),
+
+  createAlarm: (token: string, body: AlarmInput) =>
+    request<Alarm>(
+      '/alarms',
+      { method: 'POST', body: JSON.stringify(body) },
+      token,
+    ),
+
+  updateAlarm: (
+    token: string,
+    alarmId: string,
+    body: Partial<Omit<AlarmInput, 'deviceId'>>,
+  ) =>
+    request<Alarm>(
+      `/alarms/${alarmId}`,
+      { method: 'PATCH', body: JSON.stringify(body) },
+      token,
+    ),
+
+  deleteAlarm: (token: string, alarmId: string) =>
+    request<{ deleted: boolean; alarmId: string }>(
+      `/alarms/${alarmId}`,
+      { method: 'DELETE' },
+      token,
+    ),
+
+  snoozeAlarm: (token: string, alarmId: string) =>
+    request<Alarm>(
+      `/alarms/${alarmId}/snooze`,
+      { method: 'POST' },
+      token,
+    ),
+
+  dismissAlarm: (token: string, alarmId: string) =>
+    request<Alarm>(
+      `/alarms/${alarmId}/dismiss`,
+      { method: 'POST' },
+      token,
+    ),
+
+  listAlarmSounds: (token: string) =>
+    request<AlarmSound[]>('/alarm-sounds', {}, token),
+
+  uploadAlarmSound: (
+    token: string,
+    file: { uri: string; name: string; type: string },
+    title?: string,
+  ) => {
+    const body = new FormData();
+    body.append('file', file as unknown as Blob);
+    if (title) body.append('title', title);
+    return request<AlarmSound>(
+      '/alarm-sounds/upload',
+      { method: 'POST', body },
+      token,
+    );
+  },
+
+  synthesizeAlarmSound: (
+    token: string,
+    sourceId: string,
+    body: { title: string; text: string; backgroundMusicId?: string | null },
+  ) =>
+    request<AlarmSound>(
+      `/alarm-sounds/${sourceId}/synthesize`,
+      { method: 'POST', body: JSON.stringify(body) },
+      token,
+    ),
+
+  deleteAlarmSound: (token: string, soundId: string) =>
+    request<{ deleted: boolean; soundId: string; deletedAlarms: number }>(
+      `/alarm-sounds/${soundId}`,
+      { method: 'DELETE' },
+      token,
+    ),
+
+  alarmSoundAudioUrl: (soundId: string) =>
+    `${API_BASE_URL}/alarm-sounds/${encodeURIComponent(soundId)}/audio`,
 };

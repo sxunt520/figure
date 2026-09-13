@@ -6,6 +6,7 @@
 
 #include "cJSON.h"
 #include "esp_chip_info.h"
+#include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
@@ -69,6 +70,7 @@ static uint8_t volume_before_mute = 55;
 static int pending_command_count = 0;
 static bool device_bound = false;
 static volatile bool playback_stop_requested = false;
+static char active_alarm_id[40];
 static volatile bool sleep_mode_enabled = false;
 static volatile device_state_t device_state = DEVICE_STATE_BOOTING;
 static volatile TickType_t device_state_since = 0;
@@ -433,52 +435,96 @@ static void speaker_play_setup_prompt(void)
 
 static bool download_and_play_audio(const char *path, device_state_t playback_state)
 {
-    char url[384];
-    if (path == NULL || path[0] != '/' ||
-        snprintf(url, sizeof(url), "%s%s", CONFIG_FIGURE_API_BASE_URL, path) >= (int)sizeof(url)) {
+    extern const uint8_t globalsign_root_r3_pem_start[]
+        asm("_binary_globalsign_root_r3_pem_start");
+    char url[1024];
+    if (path == NULL) {
         ESP_LOGE(TAG, "Invalid audio path");
         return false;
     }
+    const bool is_absolute = strncmp(path, "http://", 7) == 0 ||
+                             strncmp(path, "https://", 8) == 0;
+    const int url_length = is_absolute
+        ? snprintf(url, sizeof(url), "%s", path)
+        : snprintf(url, sizeof(url), "%s%s", CONFIG_FIGURE_API_BASE_URL, path);
+    if ((!is_absolute && path[0] != '/') || url_length < 0 || url_length >= (int)sizeof(url)) {
+        ESP_LOGE(TAG, "Invalid or oversized audio URL");
+        return false;
+    }
+    const bool is_https = strncmp(url, "https://", 8) == 0;
+    const bool is_cos_https = is_https && strstr(url, ".cos.") != NULL &&
+                              strstr(url, ".myqcloud.com") != NULL;
 
     playback_stop_requested = false;
     device_set_state(playback_state);
-    esp_http_client_config_t config = {
-        .url = url,
-        .timeout_ms = 30000,
-        .buffer_size = 4096,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) return false;
-    char authorization[112];
-    snprintf(authorization, sizeof(authorization), "Bearer %s", access_token);
-    esp_http_client_set_header(client, "Authorization", authorization);
+    uint8_t *audio = NULL;
+    int received = 0;
+    int64_t content_length = -1;
+    for (unsigned attempt = 1; attempt <= 3; ++attempt) {
+        esp_http_client_config_t config = {
+            .url = url,
+            .timeout_ms = 12000,
+            .buffer_size = 4096,
+            .cert_pem = is_cos_https
+                ? (const char *)globalsign_root_r3_pem_start
+                : NULL,
+            .crt_bundle_attach = is_https && !is_cos_https
+                ? esp_crt_bundle_attach
+                : NULL,
+        };
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (client == NULL) break;
+        if (!is_absolute) {
+            char authorization[112];
+            snprintf(authorization, sizeof(authorization), "Bearer %s", access_token);
+            esp_http_client_set_header(client, "Authorization", authorization);
+        }
 
-    esp_err_t error = esp_http_client_open(client, 0);
-    const int64_t content_length = error == ESP_OK ? esp_http_client_fetch_headers(client) : -1;
-    const int status = error == ESP_OK ? esp_http_client_get_status_code(client) : -1;
-    if (error != ESP_OK || status != 200 || content_length <= 0 ||
-        content_length > AUDIO_DOWNLOAD_MAX_BYTES) {
-        ESP_LOGE(TAG, "Audio download rejected: error=%s status=%d bytes=%lld",
-                 esp_err_to_name(error), status, (long long)content_length);
+        const esp_err_t error = esp_http_client_open(client, 0);
+        content_length = error == ESP_OK ? esp_http_client_fetch_headers(client) : -1;
+        const int status = error == ESP_OK ? esp_http_client_get_status_code(client) : -1;
+        if (error != ESP_OK || status != 200 || content_length <= 0 ||
+            content_length > AUDIO_DOWNLOAD_MAX_BYTES) {
+            ESP_LOGW(TAG, "Audio request %u/3 failed: error=%s status=%d bytes=%lld",
+                     attempt, esp_err_to_name(error), status, (long long)content_length);
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            vTaskDelay(pdMS_TO_TICKS(250));
+            continue;
+        }
+
+        if (audio == NULL) {
+            audio = heap_caps_malloc((size_t)content_length,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (audio == NULL) {
+                audio = heap_caps_malloc((size_t)content_length, MALLOC_CAP_8BIT);
+            }
+        }
+        if (audio == NULL) {
+            ESP_LOGE(TAG, "Cannot allocate %lld bytes for audio", (long long)content_length);
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            return false;
+        }
+
+        received = 0;
+        while (received < content_length) {
+            const int chunk = esp_http_client_read(
+                client,
+                (char *)audio + received,
+                (int)(content_length - received));
+            if (chunk <= 0) break;
+            received += chunk;
+        }
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
-        return false;
+        if (received == content_length) break;
+        ESP_LOGW(TAG, "Audio request %u/3 incomplete: expected=%lld received=%d",
+                 attempt, (long long)content_length, received);
+        vTaskDelay(pdMS_TO_TICKS(250));
     }
-
-    uint8_t *audio = heap_caps_malloc((size_t)content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (audio == NULL) audio = heap_caps_malloc((size_t)content_length, MALLOC_CAP_8BIT);
-    if (audio == NULL) {
-        ESP_LOGE(TAG, "Cannot allocate %lld bytes for audio", (long long)content_length);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return false;
-    }
-
-    const int received = esp_http_client_read_response(client, (char *)audio, (int)content_length);
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    if (received != content_length) {
-        ESP_LOGE(TAG, "Incomplete audio download: expected=%lld received=%d",
+    if (audio == NULL || received != content_length) {
+        ESP_LOGE(TAG, "Audio download failed after retries: expected=%lld received=%d",
                  (long long)content_length, received);
         free(audio);
         return false;
@@ -2016,6 +2062,12 @@ static void post_device_event(const char *type, const char *message, const char 
     cJSON_AddStringToObject(request_json, "type", type);
     cJSON_AddStringToObject(payload, "message", message);
     if (command_type != NULL) cJSON_AddStringToObject(payload, "commandType", command_type);
+    if (active_alarm_id[0] != '\0' &&
+        ((command_type != NULL && strcmp(command_type, "snooze_reminder") == 0) ||
+         strcmp(type, "alarm_playback_started") == 0 ||
+         strcmp(type, "alarm_playback_completed") == 0)) {
+        cJSON_AddStringToObject(payload, "alarmId", active_alarm_id);
+    }
     cJSON_AddItemToObject(request_json, "payload", payload);
 
     char *body = cJSON_PrintUnformatted(request_json);
@@ -2048,6 +2100,7 @@ static void post_pending_button_events(void)
     }
     if ((events & DEVICE_BUTTON_EVENT_SNOOZE) != 0) {
         post_device_event("button_pressed", "功能键已请求稍后提醒", "snooze_reminder");
+        active_alarm_id[0] = '\0';
     }
     if ((events & DEVICE_BUTTON_EVENT_SLEEP_TOGGLE) != 0) {
         post_device_event("button_pressed", sleep_mode_enabled
@@ -2271,12 +2324,17 @@ static bool apply_config_command(const cJSON *command)
         const cJSON *title = cJSON_GetObjectItemCaseSensitive(payload, "title");
         const cJSON *audio_path = cJSON_GetObjectItemCaseSensitive(payload, "audioPath");
         const cJSON *kind = cJSON_GetObjectItemCaseSensitive(payload, "kind");
+        const cJSON *alarm_id = cJSON_GetObjectItemCaseSensitive(payload, "alarmId");
         const device_state_t reminder_state =
             cJSON_IsString(kind) && strcmp(kind->valuestring, "alarm") == 0
                 ? DEVICE_STATE_ALARM
                 : DEVICE_STATE_REMINDER;
         ESP_LOGI(TAG, "Play reminder: %s",
                  cJSON_IsString(title) && title->valuestring != NULL ? title->valuestring : "");
+        if (reminder_state == DEVICE_STATE_ALARM && cJSON_IsString(alarm_id) &&
+            alarm_id->valuestring != NULL) {
+            strlcpy(active_alarm_id, alarm_id->valuestring, sizeof(active_alarm_id));
+        }
         if (sleep_mode_enabled && reminder_state != DEVICE_STATE_ALARM) {
             ESP_LOGI(TAG, "Reminder skipped because sleep mode is enabled");
 #ifdef CONFIG_FIGURE_ENABLE_DISPLAY
@@ -2287,12 +2345,27 @@ static bool apply_config_command(const cJSON *command)
 #ifdef CONFIG_FIGURE_ENABLE_SPEAKER
         if (!cJSON_IsString(audio_path) || audio_path->valuestring == NULL ||
             !download_and_play_audio(audio_path->valuestring, reminder_state)) {
+            if (reminder_state == DEVICE_STATE_ALARM) {
+                post_device_event("alarm_playback_completed", "闹钟播放失败", "failed");
+                active_alarm_id[0] = '\0';
+            }
             device_set_state(DEVICE_STATE_ERROR);
             return false;
         }
 #else
         return false;
 #endif
+        if (reminder_state == DEVICE_STATE_ALARM) {
+            const bool stopped = playback_stop_requested;
+            post_device_event("alarm_playback_completed",
+                              stopped ? "闹钟已停止" : "闹钟播放完成",
+                              stopped ? "stopped" : "completed");
+            bool pending_snooze = false;
+#ifdef CONFIG_FIGURE_ENABLE_CONTROL_BUTTONS
+            pending_snooze = (pending_button_events & DEVICE_BUTTON_EVENT_SNOOZE) != 0;
+#endif
+            if (!pending_snooze) active_alarm_id[0] = '\0';
+        }
         device_set_state(DEVICE_STATE_IDLE);
         return true;
     }
