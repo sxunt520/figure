@@ -148,20 +148,36 @@ public class YuzhouProvisioningModule: Module, ESPDeviceConnectionDelegate, CBCe
       }
     }
 
-    AsyncFunction("provision") { (ssid: String, password: String, promise: Promise) in
+    AsyncFunction("provision") { (ssid: String, password: String, apiBaseUrl: String, promise: Promise) in
       guard let device = self.activeDevice else {
         promise.reject("E_NOT_CONNECTED", "请先连接智能底座")
         return
       }
+      guard let apiData = apiBaseUrl.data(using: .utf8), !apiBaseUrl.isEmpty else {
+        promise.reject("E_BACKEND_ADDRESS", "请先设置后端服务地址")
+        return
+      }
 
-      device.provision(ssid: ssid, passPhrase: password) { status in
-        switch status {
-        case .success:
-          promise.resolve(["success": true, "ssid": ssid])
-        case .configApplied:
-          break
-        case let .failure(error):
-          promise.reject("E_PROVISION_FAILED", error.localizedDescription)
+      device.sendData(path: "yuzhou-config", data: apiData) { response, error in
+        if let error {
+          promise.reject("E_BACKEND_ADDRESS", "发送后端服务地址失败：\(error.localizedDescription)")
+          return
+        }
+        let responseText = response.flatMap { String(data: $0, encoding: .utf8) }?
+          .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0")))
+        guard responseText == "SUCCESS" else {
+          promise.reject("E_BACKEND_ADDRESS", "底座未接受后端服务地址")
+          return
+        }
+        device.provision(ssid: ssid, passPhrase: password) { status in
+          switch status {
+          case .success:
+            promise.resolve(["success": true, "ssid": ssid])
+          case .configApplied:
+            break
+          case let .failure(error):
+            promise.reject("E_PROVISION_FAILED", error.localizedDescription)
+          }
         }
       }
     }

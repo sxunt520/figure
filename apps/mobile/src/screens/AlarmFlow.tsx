@@ -869,11 +869,9 @@ function AlarmPreviewScreen({
     try {
       if (soundRef.current) await soundRef.current.unloadAsync().catch(() => undefined);
       await Audio.setAudioModeAsync({ playsInSilentModeIOS: true });
+      const playback = await api.alarmSoundPlaybackUrl(token, customSoundId);
       const created = await Audio.Sound.createAsync(
-        {
-          uri: api.alarmSoundAudioUrl(customSoundId),
-          headers: { authorization: `Bearer ${token}` },
-        },
+        { uri: playback.url },
         { shouldPlay: true },
         (status) => {
           if (status.isLoaded && status.didJustFinish) setPlaying(false);

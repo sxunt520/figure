@@ -22,6 +22,7 @@ import com.espressif.provisioning.ESPProvisionManager
 import com.espressif.provisioning.WiFiAccessPoint
 import com.espressif.provisioning.listeners.BleScanListener
 import com.espressif.provisioning.listeners.ProvisionListener
+import com.espressif.provisioning.listeners.ResponseListener
 import com.espressif.provisioning.listeners.WiFiScanListener
 import expo.modules.kotlin.Promise
 import expo.modules.kotlin.modules.Module
@@ -292,13 +293,49 @@ class YuzhouProvisioningModule : Module() {
       })
     }
 
-    AsyncFunction("provision") { ssid: String, password: String, promise: Promise ->
+    AsyncFunction("provision") { ssid: String, password: String, apiBaseUrl: String, promise: Promise ->
       val device = activeDevice
       if (device == null) {
         promise.reject("E_NOT_CONNECTED", "请先连接智能底座", null)
         return@AsyncFunction
       }
-      device.provision(ssid, password, object : ProvisionListener {
+      if (apiBaseUrl.isBlank()) {
+        promise.reject("E_BACKEND_ADDRESS", "请先设置后端服务地址", null)
+        return@AsyncFunction
+      }
+      device.sendDataToCustomEndPoint(
+        "yuzhou-config",
+        apiBaseUrl.toByteArray(Charsets.UTF_8),
+        object : ResponseListener {
+          override fun onSuccess(returnData: ByteArray) {
+            val response = returnData.toString(Charsets.UTF_8).trim { it <= ' ' || it == '\u0000' }
+            if (response != "SUCCESS") {
+              promise.reject("E_BACKEND_ADDRESS", "底座未接受后端服务地址", null)
+              return
+            }
+            provisionWifi(device, ssid, password, promise)
+          }
+
+          override fun onFailure(error: Exception) {
+            promise.reject(
+              "E_BACKEND_ADDRESS",
+              "发送后端服务地址失败，请确认底座固件已更新",
+              error,
+            )
+          }
+        },
+      )
+    }
+
+    AsyncFunction("disconnect") {
+      activeDevice?.disconnectDevice()
+      activeDevice = null
+      Unit
+    }
+  }
+
+  private fun provisionWifi(device: ESPDevice, ssid: String, password: String, promise: Promise) {
+    device.provision(ssid, password, object : ProvisionListener {
         override fun createSessionFailed(error: Exception) =
           rejectProvision(promise, "E_SESSION_FAILED", "安全会话建立失败，请核对底座二维码", error)
 
@@ -329,13 +366,6 @@ class YuzhouProvisioningModule : Module() {
         override fun onProvisioningFailed(error: Exception) =
           rejectProvision(promise, "E_PROVISION_FAILED", error.message ?: "底座联网失败", error)
       })
-    }
-
-    AsyncFunction("disconnect") {
-      activeDevice?.disconnectDevice()
-      activeDevice = null
-      Unit
-    }
   }
 
   @Subscribe(threadMode = ThreadMode.MAIN)

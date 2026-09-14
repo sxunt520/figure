@@ -9,6 +9,7 @@ import {
   LoginResponse,
   Reminder,
 } from './types';
+import * as FileSystem from 'expo-file-system';
 
 export type AlarmInput = Pick<
   Alarm,
@@ -27,17 +28,63 @@ export type AlarmInput = Pick<
   | 'timezone'
 >;
 
-function normalizeApiBaseUrl(value?: string) {
-  const raw = value?.trim() || 'http://192.168.18.225:3000';
-  const withoutTrailingSlash = raw.replace(/\/+$/, '');
-  return withoutTrailingSlash.endsWith('/v1')
-    ? withoutTrailingSlash
-    : `${withoutTrailingSlash}/v1`;
+const DEFAULT_API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || 'http://192.168.18.225:3000';
+const API_SETTINGS_FILE = FileSystem.documentDirectory
+  ? `${FileSystem.documentDirectory}backend-settings.json`
+  : null;
+
+export function normalizeApiBaseUrl(value?: string) {
+  const raw = value?.trim();
+  if (!raw) throw new Error('请输入后端服务地址');
+
+  const withProtocol = /^https?:\/\//i.test(raw) ? raw : `http://${raw}`;
+  let parsed: URL;
+  try {
+    parsed = new URL(withProtocol);
+  } catch {
+    throw new Error('后端地址格式不正确，例如：http://192.168.31.157:3000');
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) {
+    throw new Error('后端地址只支持 http 或 https');
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error('后端地址不能包含账号、查询参数或锚点');
+  }
+  const path = parsed.pathname.replace(/\/+$/, '');
+  if (path && path !== '/v1') {
+    throw new Error('后端地址只需填写 IP（或域名）和端口，不要附加其他路径');
+  }
+  return `${parsed.protocol}//${parsed.host}/v1`;
 }
 
-export const API_BASE_URL = normalizeApiBaseUrl(
-  process.env.EXPO_PUBLIC_API_BASE_URL,
-);
+export let API_BASE_URL = normalizeApiBaseUrl(DEFAULT_API_BASE_URL);
+
+export function getApiBaseUrl() {
+  return API_BASE_URL;
+}
+
+export async function initializeApiBaseUrl() {
+  if (!API_SETTINGS_FILE) return API_BASE_URL;
+  try {
+    const raw = await FileSystem.readAsStringAsync(API_SETTINGS_FILE);
+    const settings = JSON.parse(raw) as { apiBaseUrl?: string };
+    API_BASE_URL = normalizeApiBaseUrl(settings.apiBaseUrl);
+  } catch {
+    API_BASE_URL = normalizeApiBaseUrl(DEFAULT_API_BASE_URL);
+  }
+  return API_BASE_URL;
+}
+
+export async function saveApiBaseUrl(value: string) {
+  const normalized = normalizeApiBaseUrl(value);
+  if (!API_SETTINGS_FILE) throw new Error('当前设备无法保存后端地址');
+  await FileSystem.writeAsStringAsync(
+    API_SETTINGS_FILE,
+    JSON.stringify({ apiBaseUrl: normalized }),
+  );
+  API_BASE_URL = normalized;
+  return normalized;
+}
 
 async function request<T>(
   path: string,
@@ -285,4 +332,11 @@ export const api = {
 
   alarmSoundAudioUrl: (soundId: string) =>
     `${API_BASE_URL}/alarm-sounds/${encodeURIComponent(soundId)}/audio`,
+
+  alarmSoundPlaybackUrl: (token: string, soundId: string) =>
+    request<{ url: string; expiresAt: string }>(
+      `/alarm-sounds/${encodeURIComponent(soundId)}/playback-url`,
+      {},
+      token,
+    ),
 };

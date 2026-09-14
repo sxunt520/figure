@@ -59,6 +59,14 @@ export class AlarmSoundsController {
     });
   }
 
+  @Get(':soundId/playback-url')
+  playbackUrl(
+    @Req() request: UserRequest,
+    @Param('soundId') soundId: string,
+  ) {
+    return this.sounds.playbackUrlForUser(request.user.id, soundId);
+  }
+
   @Delete(':soundId')
   delete(
     @Req() request: UserRequest,

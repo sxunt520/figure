@@ -42,7 +42,7 @@ type NativeProvisioningModule = {
   stopScan(): Promise<void>;
   connect(deviceId: string, pop: string, security: number): Promise<{ connected: boolean }>;
   scanWifiNetworks(): Promise<ProvisioningWifi[]>;
-  provision(ssid: string, password: string): Promise<{ success: boolean; ssid: string }>;
+  provision(ssid: string, password: string, apiBaseUrl: string): Promise<{ success: boolean; ssid: string }>;
   disconnect(): Promise<void>;
 };
 
@@ -142,6 +142,7 @@ export const provisioning = {
   connect: (deviceId: string, pop: string, security: number) =>
     getNativeProvisioning().connect(deviceId, pop, security),
   scanWifiNetworks: () => getNativeProvisioning().scanWifiNetworks(),
-  provision: (ssid: string, password: string) => getNativeProvisioning().provision(ssid, password),
+  provision: (ssid: string, password: string, apiBaseUrl: string) =>
+    getNativeProvisioning().provision(ssid, password, apiBaseUrl),
   disconnect: () => getNativeProvisioning().disconnect(),
 };

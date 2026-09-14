@@ -26,7 +26,7 @@ menu "Figure Board Self-Test"
 
     config FIGURE_API_BASE_URL
         string "Figure API base URL"
-        default "http://192.168.18.225:3000/v1"
+        default "http://192.168.31.157:3000/v1"
 
     config FIGURE_DEVICE_HARDWARE_ID
         string "Development hardware ID"

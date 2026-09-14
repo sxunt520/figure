@@ -17,7 +17,7 @@ import {
   View,
 } from 'react-native';
 import { Device } from '../types';
-import { api } from '../api';
+import { api, getApiBaseUrl } from '../api';
 import { palette } from '../theme';
 import {
   DEVELOPMENT_DESCRIPTOR,
@@ -529,7 +529,11 @@ function ProvisioningScreen({
     void (async () => {
       try {
         setActive(1);
-        await provisioning.provision(route.params.ssid, route.params.password);
+        await provisioning.provision(
+          route.params.ssid,
+          route.params.password,
+          getApiBaseUrl(),
+        );
         if (cancelled) return;
         await provisioning.disconnect();
         setNetworkReady(true);

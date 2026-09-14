@@ -47,6 +47,8 @@
 #define MICROPHONE_MAX_RECORD_MS 10000U
 #define WAV_HEADER_BYTES 44U
 #define VOLUME_STEP 5U
+#define API_BASE_URL_CAPACITY 192U
+#define PROVISIONING_CONFIG_ENDPOINT "yuzhou-config"
 
 typedef enum {
     DEVICE_STATE_BOOTING = 0,
@@ -62,6 +64,7 @@ typedef enum {
 } device_state_t;
 
 static const char *TAG = "figure_device";
+static char api_base_url[API_BASE_URL_CAPACITY] = CONFIG_FIGURE_API_BASE_URL;
 static led_strip_handle_t rgb_led;
 static EventGroupHandle_t wifi_events;
 static char access_token[ACCESS_TOKEN_CAPACITY];
@@ -105,6 +108,7 @@ static QueueHandle_t nfc_event_queue;
 
 static void device_set_state(device_state_t next_state);
 static bool save_u8(const char *key, uint8_t value);
+static bool save_string(const char *key, const char *value);
 
 #ifdef CONFIG_FIGURE_ENABLE_DISPLAY
 static bool display_ready = false;
@@ -446,7 +450,7 @@ static bool download_and_play_audio(const char *path, device_state_t playback_st
                              strncmp(path, "https://", 8) == 0;
     const int url_length = is_absolute
         ? snprintf(url, sizeof(url), "%s", path)
-        : snprintf(url, sizeof(url), "%s%s", CONFIG_FIGURE_API_BASE_URL, path);
+        : snprintf(url, sizeof(url), "%s%s", api_base_url, path);
     if ((!is_absolute && path[0] != '/') || url_length < 0 || url_length >= (int)sizeof(url)) {
         ESP_LOGE(TAG, "Invalid or oversized audio URL");
         return false;
@@ -1654,8 +1658,48 @@ static void print_board_info(void)
 #endif
     ESP_LOGI(TAG, "Free internal heap: %u bytes", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     ESP_LOGI(TAG, "RGB data GPIO: %d", CONFIG_BLINK_GPIO);
-    ESP_LOGI(TAG, "Firmware: 0.7.3-dev");
+    ESP_LOGI(TAG, "Firmware: 0.7.4-dev");
+    ESP_LOGI(TAG, "API base URL: %s", api_base_url);
     ESP_LOGI(TAG, "========================================");
+}
+
+static bool normalize_api_base_url(const char *input, size_t input_length,
+                                   char *output, size_t output_capacity)
+{
+    if (input == NULL || input_length == 0 || output == NULL || output_capacity < 16) {
+        return false;
+    }
+    while (input_length > 0 && (input[input_length - 1] == '\0' ||
+                                input[input_length - 1] == ' ' ||
+                                input[input_length - 1] == '\r' ||
+                                input[input_length - 1] == '\n' ||
+                                input[input_length - 1] == '\t')) {
+        input_length--;
+    }
+    while (input_length > 0 && (*input == ' ' || *input == '\r' ||
+                                *input == '\n' || *input == '\t')) {
+        input++;
+        input_length--;
+    }
+    if (input_length == 0 || input_length >= output_capacity) return false;
+    if (!((input_length > 7 && strncmp(input, "http://", 7) == 0) ||
+          (input_length > 8 && strncmp(input, "https://", 8) == 0))) {
+        return false;
+    }
+    for (size_t index = 0; index < input_length; ++index) {
+        const unsigned char value = (unsigned char)input[index];
+        if (value <= 0x20 || value == 0x7f) return false;
+    }
+
+    while (input_length > 0 && input[input_length - 1] == '/') input_length--;
+    const bool has_api_path = input_length >= 3 &&
+                              memcmp(input + input_length - 3, "/v1", 3) == 0;
+    const size_t suffix_length = has_api_path ? 0 : 3;
+    if (input_length + suffix_length >= output_capacity) return false;
+    memcpy(output, input, input_length);
+    if (!has_api_path) memcpy(output + input_length, "/v1", 3);
+    output[input_length + suffix_length] = '\0';
+    return true;
 }
 
 static void init_nvs(void)
@@ -1671,8 +1715,20 @@ static void init_nvs(void)
     if (nvs_open("figure", NVS_READONLY, &handle) == ESP_OK) {
         (void)nvs_get_u8(handle, "volume", &current_volume);
         if (current_volume > 0) volume_before_mute = current_volume;
+        char saved_url[API_BASE_URL_CAPACITY];
+        size_t saved_url_length = sizeof(saved_url);
+        if (nvs_get_str(handle, "api_base_url", saved_url, &saved_url_length) == ESP_OK) {
+            char normalized[API_BASE_URL_CAPACITY];
+            if (normalize_api_base_url(saved_url, strlen(saved_url), normalized,
+                                       sizeof(normalized))) {
+                snprintf(api_base_url, sizeof(api_base_url), "%s", normalized);
+            } else {
+                ESP_LOGW(TAG, "Ignoring invalid saved API base URL");
+            }
+        }
         nvs_close(handle);
     }
+    ESP_LOGI(TAG, "Runtime API base URL: %s", api_base_url);
 }
 
 static bool save_u8(const char *key, uint8_t value)
@@ -1693,6 +1749,39 @@ static bool save_string(const char *key, const char *value)
     if (error == ESP_OK) error = nvs_commit(handle);
     nvs_close(handle);
     return error == ESP_OK;
+}
+
+static esp_err_t provisioning_config_handler(uint32_t session_id,
+                                             const uint8_t *input,
+                                             ssize_t input_length,
+                                             uint8_t **output,
+                                             ssize_t *output_length,
+                                             void *private_data)
+{
+    (void)session_id;
+    (void)private_data;
+    if (input == NULL || input_length <= 0 || output == NULL || output_length == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char normalized[API_BASE_URL_CAPACITY];
+    if (!normalize_api_base_url((const char *)input, (size_t)input_length,
+                                normalized, sizeof(normalized))) {
+        ESP_LOGW(TAG, "Rejected invalid API base URL from provisioning");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!save_string("api_base_url", normalized)) {
+        ESP_LOGE(TAG, "Unable to persist API base URL");
+        return ESP_FAIL;
+    }
+    snprintf(api_base_url, sizeof(api_base_url), "%s", normalized);
+    ESP_LOGI(TAG, "Provisioning saved API base URL: %s", api_base_url);
+
+    static const char response[] = "SUCCESS";
+    *output = (uint8_t *)strdup(response);
+    if (*output == NULL) return ESP_ERR_NO_MEM;
+    *output_length = sizeof(response);
+    return ESP_OK;
 }
 
 static bool consume_provisioning_request(void)
@@ -1854,11 +1943,14 @@ static bool connect_wifi(void)
         char service_name[20];
         get_provisioning_service_name(service_name, sizeof(service_name));
         network_prov_security1_params_t *security_params = CONFIG_FIGURE_PROVISIONING_POP;
+        ESP_ERROR_CHECK(network_prov_mgr_endpoint_create(PROVISIONING_CONFIG_ENDPOINT));
         ESP_ERROR_CHECK(network_prov_mgr_start_provisioning(
             NETWORK_PROV_SECURITY_1,
             (const void *)security_params,
             service_name,
             NULL));
+        ESP_ERROR_CHECK(network_prov_mgr_endpoint_register(
+            PROVISIONING_CONFIG_ENDPOINT, provisioning_config_handler, NULL));
 #ifdef CONFIG_FIGURE_ENABLE_DISPLAY
         display_render_status("SETUP");
 #endif
@@ -1907,7 +1999,7 @@ static int http_request(esp_http_client_method_t method, const char *path, const
                         bool authenticated, http_response_t *response)
 {
     char url[320];
-    if (snprintf(url, sizeof(url), "%s%s", CONFIG_FIGURE_API_BASE_URL, path) >= (int)sizeof(url)) {
+    if (snprintf(url, sizeof(url), "%s%s", api_base_url, path) >= (int)sizeof(url)) {
         ESP_LOGE(TAG, "API URL is too long");
         return -1;
     }
@@ -1944,7 +2036,7 @@ static int http_binary_post(const char *path, const uint8_t *data,
                             http_response_t *response)
 {
     char url[384];
-    if (snprintf(url, sizeof(url), "%s%s", CONFIG_FIGURE_API_BASE_URL, path) >=
+    if (snprintf(url, sizeof(url), "%s%s", api_base_url, path) >=
         (int)sizeof(url)) {
         ESP_LOGE(TAG, "Binary API URL is too long");
         return -1;

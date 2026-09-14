@@ -13,7 +13,14 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { API_BASE_URL, api } from './src/api';
+import {
+  API_BASE_URL,
+  api,
+  getApiBaseUrl,
+  initializeApiBaseUrl,
+  normalizeApiBaseUrl,
+  saveApiBaseUrl,
+} from './src/api';
 import { FigureFlow } from './src/screens/FigureFlow';
 import { AlarmFlow } from './src/screens/AlarmFlow';
 import { palette } from './src/theme';
@@ -55,11 +62,12 @@ export default function App() {
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState('');
+  const [apiBaseUrl, setApiBaseUrl] = useState(API_BASE_URL);
 
   const device = devices[0] ?? null;
 
-  const refresh = useCallback(
-    async (activeToken = token) => {
+  const refreshWithToken = useCallback(
+    async (activeToken: string) => {
       if (!activeToken) return;
       const [nextCharacters, nextDevices, nextReminders] = await Promise.all([
         api.listCharacters(activeToken),
@@ -86,23 +94,41 @@ export default function App() {
         setMessages([]);
       }
     },
-    [token],
+    [],
+  );
+
+  const refresh = useCallback(
+    async (activeToken = token) => refreshWithToken(activeToken),
+    [refreshWithToken, token],
+  );
+
+  const connectBackend = useCallback(async (loadSavedAddress = false) => {
+    setBusy(true);
+    setError('');
+    try {
+      if (loadSavedAddress) await initializeApiBaseUrl();
+      setApiBaseUrl(getApiBaseUrl());
+      const session = await api.loginDemo();
+      setToken(session.accessToken);
+      setUser(session.user);
+      await refreshWithToken(session.accessToken);
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : '初始化失败';
+      setError(message);
+      throw caught;
+    } finally {
+      setBusy(false);
+    }
+  }, [refreshWithToken]);
+
+  const handleBackendChanged = useCallback(
+    () => connectBackend(false),
+    [connectBackend],
   );
 
   useEffect(() => {
-    void (async () => {
-      try {
-        const session = await api.loginDemo();
-        setToken(session.accessToken);
-        setUser(session.user);
-        await refresh(session.accessToken);
-      } catch (caught) {
-        setError(caught instanceof Error ? caught.message : '初始化失败');
-      } finally {
-        setBusy(false);
-      }
-    })();
-  }, []);
+    void connectBackend(true).catch(() => undefined);
+  }, [connectBackend]);
 
   useEffect(() => {
     if (!token) return;
@@ -167,7 +193,13 @@ export default function App() {
         }}
       >
         <Tabs.Screen name="AI手办">
-          {() => <FigureFlow device={device} token={token} onDeviceChanged={refresh} />}
+          {() => (
+            <FigureFlow
+              device={device}
+              token={token}
+              onDeviceChanged={refresh}
+            />
+          )}
         </Tabs.Screen>
         <Tabs.Screen name="AI闹钟">
           {() => <AlarmFlow token={token} device={device} />}
@@ -188,6 +220,8 @@ export default function App() {
                 commands={commands}
                 events={events}
                 messages={messages}
+                apiBaseUrl={apiBaseUrl}
+                onBackendChanged={handleBackendChanged}
                 onAction={perform}
                 onNeedBind={() => navigation.navigate('绑定')}
               />
@@ -268,7 +302,7 @@ function DebugScreenFrame({
       ) : null}
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
         {children}
-        <Text style={styles.endpoint}>API：{API_BASE_URL}</Text>
+        <Text style={styles.endpoint}>API：{getApiBaseUrl()}</Text>
       </ScrollView>
     </SafeAreaView>
   );
@@ -281,6 +315,8 @@ function HomeScreen({
   commands,
   events,
   messages,
+  apiBaseUrl,
+  onBackendChanged,
   onAction,
   onNeedBind,
 }: {
@@ -290,11 +326,15 @@ function HomeScreen({
   commands: DeviceCommand[];
   events: DeviceEvent[];
   messages: ConversationMessage[];
+  apiBaseUrl: string;
+  onBackendChanged: () => Promise<void>;
   onAction: (action: () => Promise<unknown>, message?: string) => Promise<void>;
   onNeedBind: () => void;
 }) {
   const [speech, setSpeech] = useState('该起床啦，今天也要元气满满！');
   const [nameDraft, setNameDraft] = useState(device?.name ?? '');
+  const [backendAddress, setBackendAddress] = useState(apiBaseUrl.replace(/\/v1$/, ''));
+  const [savingBackend, setSavingBackend] = useState(false);
   const [nfcCharacterId, setNfcCharacterId] = useState(
     device?.characterId ?? characters[0]?.id ?? '',
   );
@@ -324,24 +364,80 @@ function HomeScreen({
   }, [device?.id, device?.name]);
 
   useEffect(() => {
+    setBackendAddress(apiBaseUrl.replace(/\/v1$/, ''));
+  }, [apiBaseUrl]);
+
+  const saveBackendAddress = async () => {
+    if (savingBackend) return;
+    try {
+      setSavingBackend(true);
+      const normalized = normalizeApiBaseUrl(backendAddress);
+      await saveApiBaseUrl(normalized);
+      setBackendAddress(normalized.replace(/\/v1$/, ''));
+      try {
+        await onBackendChanged();
+        Alert.alert('保存成功', 'APP 已切换到新后端地址；下次配网会自动同步给底座。');
+      } catch (connectionError) {
+        Alert.alert(
+          '地址已保存，但暂时无法连接',
+          connectionError instanceof Error ? connectionError.message : '请确认后端已启动',
+        );
+      }
+    } catch (saveError) {
+      Alert.alert('保存失败', saveError instanceof Error ? saveError.message : '地址格式不正确');
+    } finally {
+      setSavingBackend(false);
+    }
+  };
+
+  useEffect(() => {
     if (!nfcCharacterId && characters[0]) {
       setNfcCharacterId(device?.characterId ?? characters[0].id);
     }
   }, [characters, device?.characterId, nfcCharacterId]);
 
+  const connectionSettings = (
+    <>
+      <SectionTitle title="连接设置" subtitle="换网络时修改，配网会同步到智能底座" />
+      <View style={styles.panel}>
+        <FieldLabel label="后端服务地址" />
+        <TextInput
+          style={styles.input}
+          value={backendAddress}
+          onChangeText={setBackendAddress}
+          autoCapitalize="none"
+          autoCorrect={false}
+          keyboardType="url"
+          placeholder="http://电脑IP:3000"
+        />
+        <Text style={styles.meta}>例如：http://192.168.31.157:3000</Text>
+        <PrimaryButton
+          label={savingBackend ? '正在保存并检测…' : '保存并检测连接'}
+          disabled={savingBackend}
+          onPress={() => void saveBackendAddress()}
+        />
+      </View>
+    </>
+  );
+
   if (!device) {
     return (
-      <EmptyCard
-        title="还没有绑定底座"
-        body="硬件到达前可以使用模拟设备。测试绑定码是 FIGURE-0001。"
-        action="开始绑定"
-        onPress={onNeedBind}
-      />
+      <>
+        {connectionSettings}
+        <EmptyCard
+          title="还没有绑定底座"
+          body="硬件到达前可以使用模拟设备。测试绑定码是 FIGURE-0001。"
+          action="开始绑定"
+          onPress={onNeedBind}
+        />
+      </>
     );
   }
 
   return (
     <>
+      {connectionSettings}
+
       <View style={styles.heroCard}>
         <View style={styles.rowBetween}>
           <View style={styles.deviceIcon}><Text style={styles.deviceIconText}>◉</Text></View>

@@ -16,7 +16,10 @@ import { Repository } from 'typeorm';
 import { AlarmSound } from './contracts';
 import { SynthesizeAlarmSoundDto } from './dto';
 import { AlarmEntity, AlarmSoundEntity } from './entities';
-import { buildAlarmCosObjectKey } from './alarm-storage';
+import {
+  buildAlarmCosObjectKey,
+  isOpaqueAlarmCosObjectKey,
+} from './alarm-storage';
 import { TtsService } from './tts.service';
 
 const ffmpegPath = require('ffmpeg-static') as string | null;
@@ -42,7 +45,15 @@ export class AlarmSoundService implements OnModuleInit {
   onModuleInit() {
     // Older recordings only existed on the API server. Move them to COS in the
     // background so all future alarm playback can bypass the API data path.
-    setImmediate(() => void this.migrateLegacyPlaybackFiles());
+    setImmediate(() => {
+      void this.migrateLegacyPlaybackFiles().catch((error) => {
+        this.logger.warn(
+          `Alarm playback migration deferred: ${
+            error instanceof Error ? error.message : 'unknown error'
+          }`,
+        );
+      });
+    });
   }
 
   async list(userId: string): Promise<AlarmSound[]> {
@@ -69,7 +80,7 @@ export class AlarmSoundService implements OnModuleInit {
 
     const id = randomUUID();
     const title = (requestedTitle?.trim() || file.originalname.replace(/\.[^.]+$/, '') || '我的录音').slice(0, 120);
-    const objectKey = buildAlarmCosObjectKey(title, extension);
+    const objectKey = buildAlarmCosObjectKey(extension);
     const uploaded = await this.putCosObject(objectKey, file.buffer, file.mimetype || `audio/${extension}`);
     await mkdir(this.directory, { recursive: true });
     const inputPath = resolve(this.directory, `${id}.source.${extension}`);
@@ -85,10 +96,7 @@ export class AlarmSoundService implements OnModuleInit {
       await unlink(inputPath).catch(() => undefined);
     }
 
-    const outputObjectKey = buildAlarmCosObjectKey(
-      `${title}_播放版_${id.slice(0, 8)}`,
-      'wav',
-    );
+    const outputObjectKey = buildAlarmCosObjectKey('wav');
     const normalizedAudio = await readFile(outputPath);
     const normalizedUpload = await this.putCosObject(
       outputObjectKey,
@@ -204,6 +212,14 @@ export class AlarmSoundService implements OnModuleInit {
     return this.readLocal(sound);
   }
 
+  async playbackUrlForUser(userId: string, soundId: string) {
+    const playback = await this.resolvePlayback(userId, soundId);
+    return {
+      url: playback.audioPath,
+      expiresAt: new Date(Date.now() + 55 * 60_000).toISOString(),
+    };
+  }
+
   async resolvePlayback(userId: string, soundId: string) {
     const sound = await this.requireOwned(userId, soundId);
     if (sound.status !== 'ready') {
@@ -238,10 +254,7 @@ export class AlarmSoundService implements OnModuleInit {
         '-ac', '1', '-ar', '24000', '-c:a', 'pcm_s16le', cloneSamplePath,
       ]);
       const cloneSample = await readFile(cloneSamplePath);
-      cloneSampleObjectKey = buildAlarmCosObjectKey(
-        `${sound.title}_音色样本_${sound.id.slice(0, 8)}`,
-        'wav',
-      );
+      cloneSampleObjectKey = buildAlarmCosObjectKey('wav');
       await this.putCosObject(cloneSampleObjectKey, cloneSample, 'audio/wav');
       const signedSourceUrl = this.signedCosUrl(cloneSampleObjectKey);
       const voice = await this.tts.cloneVoice(
@@ -261,10 +274,7 @@ export class AlarmSoundService implements OnModuleInit {
         await writeFile(outputPath, speechAudio.buffer);
       }
       const outputBuffer = await readFile(outputPath);
-      const outputObjectKey = buildAlarmCosObjectKey(
-        `${sound.title}_成品_${sound.id.slice(0, 8)}`,
-        'wav',
-      );
+      const outputObjectKey = buildAlarmCosObjectKey('wav');
       const uploaded = await this.putCosObject(outputObjectKey, outputBuffer, 'audio/wav');
       sound.voiceId = voice.voiceId;
       sound.ttsModel = voice.model;
@@ -324,8 +334,13 @@ export class AlarmSoundService implements OnModuleInit {
   }
 
   private async ensureCloudPlayback(sound: AlarmSoundEntity) {
-    const suffix = `_${sound.id.slice(0, 8)}.wav`;
-    if (sound.outputObjectKey?.endsWith(suffix)) return sound.outputObjectKey;
+    if (
+      sound.outputObjectKey &&
+      isOpaqueAlarmCosObjectKey(sound.outputObjectKey, 'wav')
+    ) {
+      return sound.outputObjectKey;
+    }
+    const previousObjectKey = sound.outputObjectKey;
     const localPath = resolve(this.directory, sound.localFileName);
     let buffer: Buffer;
     try {
@@ -340,25 +355,54 @@ export class AlarmSoundService implements OnModuleInit {
         throw new NotFoundException('铃声文件不存在，无法迁移到云端');
       }
     }
-    const objectKey = buildAlarmCosObjectKey(
-      `${sound.title}_${sound.kind === 'diy' ? '成品' : '播放版'}_${sound.id.slice(0, 8)}`,
-      'wav',
-    );
+    const objectKey = buildAlarmCosObjectKey('wav');
     const uploaded = await this.putCosObject(objectKey, buffer, 'audio/wav');
     sound.outputObjectKey = objectKey;
     sound.outputUrl = uploaded.url;
     await this.soundRepository.save(sound);
+    await this.deleteUnreferencedObject(previousObjectKey, 'outputObjectKey');
     this.logger.log(`Alarm playback migrated to COS id=${sound.id} key=${objectKey}`);
     return objectKey;
   }
 
-  private async migrateLegacyPlaybackFiles() {
-    const sounds = await this.soundRepository.find({
-      where: { status: 'ready' },
+  private async ensureCloudSource(sound: AlarmSoundEntity) {
+    if (isOpaqueAlarmCosObjectKey(sound.sourceObjectKey)) return;
+    const previousObjectKey = sound.sourceObjectKey;
+    const extension = this.audioExtension(
+      previousObjectKey,
+      sound.sourceMimeType || '',
+    ) || 'wav';
+    const buffer = await this.getCosObject(previousObjectKey);
+    const objectKey = buildAlarmCosObjectKey(extension);
+    const uploaded = await this.putCosObject(
+      objectKey,
+      buffer,
+      sound.sourceMimeType || `audio/${extension}`,
+    );
+    sound.sourceObjectKey = objectKey;
+    sound.sourceUrl = uploaded.url;
+    await this.soundRepository.save(sound);
+    await this.deleteUnreferencedObject(previousObjectKey, 'sourceObjectKey');
+    this.logger.log(`Alarm source migrated to COS id=${sound.id} key=${objectKey}`);
+  }
+
+  private async deleteUnreferencedObject(
+    objectKey: string | null,
+    column: 'sourceObjectKey' | 'outputObjectKey',
+  ) {
+    if (!objectKey) return;
+    const references = await this.soundRepository.count({
+      where: { [column]: objectKey },
     });
+    if (references === 0) await this.deleteCosObject(objectKey);
+  }
+
+  private async migrateLegacyPlaybackFiles() {
+    const sounds = await this.soundRepository.find();
     for (const sound of sounds) {
       try {
-        await this.ensureCloudPlayback(sound);
+        await this.ensureCloudSource(sound);
+        if (sound.status === 'ready') await this.ensureCloudPlayback(sound);
       } catch (error) {
         this.logger.warn(
           `Alarm playback migration deferred id=${sound.id}: ${
