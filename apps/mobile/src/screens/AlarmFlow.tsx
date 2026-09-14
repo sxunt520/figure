@@ -539,7 +539,7 @@ function AlarmHomeScreen({
   const deleting = alarms.find((alarm) => alarm.id === deleteId);
 
   return (
-    <Page>
+    <Page scroll>
       <ScreenHeader title="AI闹钟" />
       <View style={styles.countdownRow}>
         {ringingAlarm ? (
@@ -607,7 +607,10 @@ function AlarmHomeScreen({
           return (
             <Pressable
               key={alarm.id}
-              style={styles.alarmCard}
+              style={[
+                styles.alarmCard,
+                menuId === alarm.id && styles.alarmCardMenuOpen,
+              ]}
               onPress={() => {
                 onEdit(alarm);
                 navigation.navigate('AlarmEditor');
@@ -654,7 +657,8 @@ function AlarmHomeScreen({
                 <View style={styles.cardMenu}>
                   <Pressable
                     style={styles.menuRow}
-                    onPress={() => {
+                    onPress={(event) => {
+                      event.stopPropagation();
                       setMenuId(null);
                       setDeleteId(alarm.id);
                     }}
@@ -664,7 +668,8 @@ function AlarmHomeScreen({
                   <View style={styles.menuDivider} />
                   <Pressable
                     style={styles.menuRow}
-                    onPress={() => {
+                    onPress={(event) => {
+                      event.stopPropagation();
                       setMenuId(null);
                       navigation.navigate('AlarmPreview', {
                         themeId: alarm.themeId,
@@ -1732,8 +1737,9 @@ const styles = StyleSheet.create({
   syncFailedIcon: { width: 24, height: 24, borderRadius: 12, backgroundColor: colors.danger, color: '#FFFFFF', textAlign: 'center', lineHeight: 23, fontSize: 19, fontWeight: '700' },
   syncFailedText: { color: colors.danger, fontSize: 13, fontWeight: '800' },
   syncRetryText: { color: '#8C7447', fontSize: 12, fontWeight: '800' },
-  alarmList: { gap: 16, marginTop: 5 },
-  alarmCard: { minHeight: 120, backgroundColor: colors.cream, borderRadius: 17, padding: 16, flexDirection: 'row', alignItems: 'center' },
+  alarmList: { gap: 16, marginTop: 5, overflow: 'visible' },
+  alarmCard: { minHeight: 120, backgroundColor: colors.cream, borderRadius: 17, padding: 16, flexDirection: 'row', alignItems: 'center', overflow: 'visible', zIndex: 1 },
+  alarmCardMenuOpen: { zIndex: 30, elevation: 30 },
   alarmIconCircle: { width: 66, height: 66, borderRadius: 33, backgroundColor: colors.sand, alignItems: 'center', justifyContent: 'center' },
   alarmIcon: { fontSize: 31 },
   alarmAvatar: { width: 66, height: 66, borderRadius: 33 },
@@ -1745,7 +1751,7 @@ const styles = StyleSheet.create({
   lifecycleSnoozing: { color: '#927A4B' },
   alarmActions: { alignSelf: 'stretch', justifyContent: 'space-between', alignItems: 'flex-end' },
   moreText: { color: '#8E8E8E', fontSize: 33, lineHeight: 34 },
-  cardMenu: { position: 'absolute', zIndex: 5, right: 42, top: 75, width: 145, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: '#FFFFFF', borderRadius: 12, shadowColor: '#000', shadowOpacity: 0.14, shadowRadius: 14, shadowOffset: { width: 0, height: 6 }, elevation: 8 },
+  cardMenu: { position: 'absolute', zIndex: 40, right: 42, top: 75, width: 145, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: '#FFFFFF', borderRadius: 12, shadowColor: '#000', shadowOpacity: 0.14, shadowRadius: 14, shadowOffset: { width: 0, height: 6 }, elevation: 40 },
   menuRow: { height: 39, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   menuLabel: { color: colors.muted, fontSize: 16 },
   menuIcon: { color: colors.muted, fontSize: 19 },
