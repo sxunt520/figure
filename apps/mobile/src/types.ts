@@ -81,6 +81,16 @@ export interface Alarm {
   updatedAt: string;
 }
 
+export interface AlarmSyncStatus {
+  state: 'idle' | 'pending' | 'syncing' | 'synced' | 'failed';
+  revision: string | null;
+  commandId: string | null;
+  totalEnabled: number;
+  cachedCount: number;
+  message: string | null;
+  updatedAt: string | null;
+}
+
 export interface AlarmSound {
   id: string;
   title: string;
@@ -103,6 +113,8 @@ export interface AlarmSound {
 
 export type CommandType =
   | 'sync_character'
+  | 'sync_alarms'
+  | 'control_alarm'
   | 'play_reminder'
   | 'speak_text'
   | 'start_listening'

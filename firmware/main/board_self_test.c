@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "cJSON.h"
 #include "esp_chip_info.h"
@@ -16,6 +17,7 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_psram.h"
 #include "esp_spiffs.h"
 #include "esp_system.h"
@@ -49,6 +51,11 @@
 #define VOLUME_STEP 5U
 #define API_BASE_URL_CAPACITY 192U
 #define PROVISIONING_CONFIG_ENDPOINT "yuzhou-config"
+#define FIRMWARE_VERSION "0.8.0-dev"
+#define AUDIO_BASE_PATH "/audio"
+#define OFFLINE_ALARM_MAX_COUNT 8U
+#define OFFLINE_ALARM_STORE_MAGIC 0x59414c4dU
+#define OFFLINE_ALARM_STORE_VERSION 1U
 
 typedef enum {
     DEVICE_STATE_BOOTING = 0,
@@ -82,6 +89,31 @@ static volatile bool talk_button_down = false;
 static TaskHandle_t figure_network_task_handle;
 static bool wifi_handler_registered = false;
 
+typedef struct {
+    char id[40];
+    char audio_path[40];
+    uint8_t hour;
+    uint8_t minute;
+    uint8_t days_mask;
+    uint8_t snooze_enabled;
+    uint8_t snooze_minutes;
+    uint8_t snooze_count;
+    uint8_t snooze_used_count;
+    int64_t last_trigger_minute;
+    int64_t snooze_at;
+} offline_alarm_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t count;
+    offline_alarm_t alarms[OFFLINE_ALARM_MAX_COUNT];
+} offline_alarm_store_t;
+
+static offline_alarm_store_t offline_alarm_store;
+static SemaphoreHandle_t offline_alarm_mutex;
+static bool time_sync_initialized = false;
+
 #ifdef CONFIG_FIGURE_ENABLE_CONTROL_BUTTONS
 typedef enum {
     DEVICE_BUTTON_EVENT_NONE = 0,
@@ -109,6 +141,10 @@ static QueueHandle_t nfc_event_queue;
 static void device_set_state(device_state_t next_state);
 static bool save_u8(const char *key, uint8_t value);
 static bool save_string(const char *key, const char *value);
+static bool save_offline_alarm_store(void);
+static bool schedule_active_alarm_snooze(void);
+static void post_alarm_sync_event(const char *type, const char *revision,
+                                  const char *message, uint16_t cached_count);
 
 #ifdef CONFIG_FIGURE_ENABLE_DISPLAY
 static bool display_ready = false;
@@ -127,7 +163,6 @@ static void display_render_state_animation(device_state_t state, unsigned frame)
 #endif
 
 #ifdef CONFIG_FIGURE_ENABLE_SPEAKER
-#define AUDIO_BASE_PATH "/audio"
 #define PROMPT_SETUP_PATH AUDIO_BASE_PATH "/setup_prompt.wav"
 #define PROMPT_VOLUME_UP_PATH AUDIO_BASE_PATH "/prompts/volume_up.wav"
 #define PROMPT_VOLUME_DOWN_PATH AUDIO_BASE_PATH "/prompts/volume_down.wav"
@@ -541,6 +576,124 @@ static bool download_and_play_audio(const char *path, device_state_t playback_st
     }
     free(audio);
     return played;
+}
+
+static bool download_audio_to_file(const char *path, const char *target_path)
+{
+    extern const uint8_t globalsign_root_r3_pem_start[]
+        asm("_binary_globalsign_root_r3_pem_start");
+    if (!audio_storage_mounted || path == NULL || target_path == NULL) return false;
+
+    char url[1024];
+    char temporary_path[64];
+    const bool is_absolute = strncmp(path, "http://", 7) == 0 ||
+                             strncmp(path, "https://", 8) == 0;
+    const int url_length = is_absolute
+        ? snprintf(url, sizeof(url), "%s", path)
+        : snprintf(url, sizeof(url), "%s%s", api_base_url, path);
+    if ((!is_absolute && path[0] != '/') || url_length < 0 ||
+        url_length >= (int)sizeof(url) ||
+        snprintf(temporary_path, sizeof(temporary_path), "%s.tmp", target_path) >=
+            (int)sizeof(temporary_path)) {
+        ESP_LOGE(TAG, "Invalid alarm cache URL or path");
+        return false;
+    }
+    const bool is_https = strncmp(url, "https://", 8) == 0;
+    const bool is_cos_https = is_https && strstr(url, ".cos.") != NULL &&
+                              strstr(url, ".myqcloud.com") != NULL;
+
+    remove(temporary_path);
+    for (unsigned attempt = 1; attempt <= 3; ++attempt) {
+        esp_http_client_config_t config = {
+            .url = url,
+            .timeout_ms = 30000,
+            .buffer_size = 4096,
+            .cert_pem = is_cos_https
+                ? (const char *)globalsign_root_r3_pem_start
+                : NULL,
+            .crt_bundle_attach = is_https && !is_cos_https
+                ? esp_crt_bundle_attach
+                : NULL,
+        };
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (client == NULL) return false;
+        if (!is_absolute) {
+            char authorization[112];
+            snprintf(authorization, sizeof(authorization), "Bearer %s", access_token);
+            esp_http_client_set_header(client, "Authorization", authorization);
+        }
+
+        const esp_err_t open_error = esp_http_client_open(client, 0);
+        const int64_t content_length =
+            open_error == ESP_OK ? esp_http_client_fetch_headers(client) : -1;
+        const int status =
+            open_error == ESP_OK ? esp_http_client_get_status_code(client) : -1;
+        size_t total = 0;
+        size_t used = 0;
+        const bool storage_ok = esp_spiffs_info("audio", &total, &used) == ESP_OK;
+        if (open_error != ESP_OK || status != 200 || content_length < 44 ||
+            content_length > AUDIO_DOWNLOAD_MAX_BYTES ||
+            (storage_ok && (uint64_t)content_length + 8192U > total - used)) {
+            ESP_LOGW(TAG,
+                     "Alarm cache request %u/3 failed: error=%s status=%d bytes=%lld free=%u",
+                     attempt, esp_err_to_name(open_error), status,
+                     (long long)content_length,
+                     storage_ok ? (unsigned)(total - used) : 0U);
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            vTaskDelay(pdMS_TO_TICKS(350));
+            continue;
+        }
+
+        FILE *file = fopen(temporary_path, "wb");
+        if (file == NULL) {
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            ESP_LOGE(TAG, "Unable to open alarm cache file: %s", temporary_path);
+            return false;
+        }
+        uint8_t buffer[4096];
+        int64_t received = 0;
+        bool write_ok = true;
+        while (received < content_length) {
+            const int requested =
+                content_length - received > (int64_t)sizeof(buffer)
+                    ? (int)sizeof(buffer)
+                    : (int)(content_length - received);
+            const int chunk = esp_http_client_read(client, (char *)buffer, requested);
+            if (chunk <= 0) break;
+            if (fwrite(buffer, 1, (size_t)chunk, file) != (size_t)chunk) {
+                write_ok = false;
+                break;
+            }
+            received += chunk;
+        }
+        fclose(file);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        if (write_ok && received == content_length) {
+            uint8_t header[12];
+            file = fopen(temporary_path, "rb");
+            const bool valid_wav = file != NULL &&
+                                   fread(header, 1, sizeof(header), file) == sizeof(header) &&
+                                   memcmp(header, "RIFF", 4) == 0 &&
+                                   memcmp(header + 8, "WAVE", 4) == 0;
+            if (file != NULL) fclose(file);
+            if (valid_wav) {
+                remove(target_path);
+                if (rename(temporary_path, target_path) == 0) {
+                    ESP_LOGI(TAG, "Alarm audio cached: %s bytes=%lld",
+                             target_path, (long long)content_length);
+                    return true;
+                }
+            }
+        }
+        ESP_LOGW(TAG, "Alarm cache request %u/3 incomplete", attempt);
+        remove(temporary_path);
+        vTaskDelay(pdMS_TO_TICKS(350));
+    }
+    return false;
 }
 #endif
 
@@ -1514,7 +1667,9 @@ static void handle_function_button(void)
     ESP_LOGI(TAG, "Button: function");
     if (device_state == DEVICE_STATE_ALARM || device_state == DEVICE_STATE_REMINDER) {
         playback_stop_requested = true;
-        ESP_LOGI(TAG, "Function button requested snooze");
+        const bool local_snooze_scheduled = schedule_active_alarm_snooze();
+        ESP_LOGI(TAG, "Function button requested snooze; local=%s",
+                 local_snooze_scheduled ? "yes" : "no");
 #ifdef CONFIG_FIGURE_ENABLE_DISPLAY
         display_render_status("SNOOZE");
 #endif
@@ -1658,7 +1813,7 @@ static void print_board_info(void)
 #endif
     ESP_LOGI(TAG, "Free internal heap: %u bytes", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     ESP_LOGI(TAG, "RGB data GPIO: %d", CONFIG_BLINK_GPIO);
-    ESP_LOGI(TAG, "Firmware: 0.7.4-dev");
+    ESP_LOGI(TAG, "Firmware: %s", FIRMWARE_VERSION);
     ESP_LOGI(TAG, "API base URL: %s", api_base_url);
     ESP_LOGI(TAG, "========================================");
 }
@@ -1711,6 +1866,12 @@ static void init_nvs(void)
     }
     ESP_ERROR_CHECK(error);
 
+    offline_alarm_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(offline_alarm_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK);
+    memset(&offline_alarm_store, 0, sizeof(offline_alarm_store));
+    offline_alarm_store.magic = OFFLINE_ALARM_STORE_MAGIC;
+    offline_alarm_store.version = OFFLINE_ALARM_STORE_VERSION;
+
     nvs_handle_t handle;
     if (nvs_open("figure", NVS_READONLY, &handle) == ESP_OK) {
         (void)nvs_get_u8(handle, "volume", &current_volume);
@@ -1726,9 +1887,21 @@ static void init_nvs(void)
                 ESP_LOGW(TAG, "Ignoring invalid saved API base URL");
             }
         }
+        size_t alarm_store_size = sizeof(offline_alarm_store);
+        if (nvs_get_blob(handle, "offline_alarms", &offline_alarm_store,
+                         &alarm_store_size) != ESP_OK ||
+            alarm_store_size != sizeof(offline_alarm_store) ||
+            offline_alarm_store.magic != OFFLINE_ALARM_STORE_MAGIC ||
+            offline_alarm_store.version != OFFLINE_ALARM_STORE_VERSION ||
+            offline_alarm_store.count > OFFLINE_ALARM_MAX_COUNT) {
+            memset(&offline_alarm_store, 0, sizeof(offline_alarm_store));
+            offline_alarm_store.magic = OFFLINE_ALARM_STORE_MAGIC;
+            offline_alarm_store.version = OFFLINE_ALARM_STORE_VERSION;
+        }
         nvs_close(handle);
     }
     ESP_LOGI(TAG, "Runtime API base URL: %s", api_base_url);
+    ESP_LOGI(TAG, "Offline alarms restored: %u", offline_alarm_store.count);
 }
 
 static bool save_u8(const char *key, uint8_t value)
@@ -1748,6 +1921,21 @@ static bool save_string(const char *key, const char *value)
     esp_err_t error = nvs_set_str(handle, key, value);
     if (error == ESP_OK) error = nvs_commit(handle);
     nvs_close(handle);
+    return error == ESP_OK;
+}
+
+static bool save_offline_alarm_store(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open("figure", NVS_READWRITE, &handle) != ESP_OK) return false;
+    esp_err_t error = nvs_set_blob(handle, "offline_alarms",
+                                   &offline_alarm_store,
+                                   sizeof(offline_alarm_store));
+    if (error == ESP_OK) error = nvs_commit(handle);
+    nvs_close(handle);
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to save offline alarms: %s", esp_err_to_name(error));
+    }
     return error == ESP_OK;
 }
 
@@ -2112,7 +2300,7 @@ static bool create_device_session(void)
 static int send_heartbeat(void)
 {
     cJSON *request_json = cJSON_CreateObject();
-    cJSON_AddStringToObject(request_json, "firmwareVersion", "0.7.3-dev");
+    cJSON_AddStringToObject(request_json, "firmwareVersion", FIRMWARE_VERSION);
     cJSON_AddNumberToObject(request_json, "volume", current_volume);
     char *body = cJSON_PrintUnformatted(request_json);
     const int status = http_request(HTTP_METHOD_POST, "/device/heartbeat", body, true, &http_response);
@@ -2166,6 +2354,28 @@ static void post_device_event(const char *type, const char *message, const char 
     const int status = http_request(HTTP_METHOD_POST, "/device/events", body, true, &http_response);
     if (status != 200 && status != 201) {
         ESP_LOGW(TAG, "Device event post failed, HTTP status=%d", status);
+    }
+    cJSON_free(body);
+    cJSON_Delete(request_json);
+}
+
+static void post_alarm_sync_event(const char *type, const char *revision,
+                                  const char *message, uint16_t cached_count)
+{
+    cJSON *request_json = cJSON_CreateObject();
+    cJSON *payload = cJSON_CreateObject();
+    cJSON_AddStringToObject(request_json, "type", type);
+    cJSON_AddStringToObject(payload, "revision", revision);
+    cJSON_AddStringToObject(payload, "message", message);
+    cJSON_AddNumberToObject(payload, "cachedCount", cached_count);
+    cJSON_AddItemToObject(request_json, "payload", payload);
+
+    char *body = cJSON_PrintUnformatted(request_json);
+    const int status = http_request(HTTP_METHOD_POST, "/device/events", body,
+                                    true, &http_response);
+    if (status != 200 && status != 201) {
+        ESP_LOGW(TAG, "Alarm sync event post failed type=%s status=%d", type,
+                 status);
     }
     cJSON_free(body);
     cJSON_Delete(request_json);
@@ -2329,6 +2539,188 @@ static bool record_and_upload(const char *command_id, uint32_t duration_ms,
 }
 #endif
 
+static void offline_alarm_cache_path(const char *alarm_id, char *path,
+                                     size_t path_capacity)
+{
+    char compact[13] = {0};
+    size_t written = 0;
+    for (size_t index = 0; alarm_id != NULL && alarm_id[index] != '\0' &&
+                           written < sizeof(compact) - 1;
+         ++index) {
+        const char value = alarm_id[index];
+        if ((value >= '0' && value <= '9') ||
+            (value >= 'a' && value <= 'f') ||
+            (value >= 'A' && value <= 'F')) {
+            compact[written++] = value;
+        }
+    }
+    snprintf(path, path_capacity, AUDIO_BASE_PATH "/a%s.wav", compact);
+}
+
+static bool offline_alarm_store_uses_path(const offline_alarm_store_t *store,
+                                          const char *path)
+{
+    for (uint16_t index = 0; index < store->count; ++index) {
+        if (strcmp(store->alarms[index].audio_path, path) == 0) return true;
+    }
+    return false;
+}
+
+static const offline_alarm_t *find_saved_offline_alarm(
+    const offline_alarm_store_t *store, const char *alarm_id)
+{
+    for (uint16_t index = 0; index < store->count; ++index) {
+        if (strcmp(store->alarms[index].id, alarm_id) == 0) {
+            return &store->alarms[index];
+        }
+    }
+    return NULL;
+}
+
+static bool fail_alarm_sync(const char *revision, const char *message)
+{
+    ESP_LOGE(TAG, "Alarm sync failed: %s", message);
+    post_alarm_sync_event("alarm_sync_failed", revision, message, 0);
+#ifdef CONFIG_FIGURE_ENABLE_DISPLAY
+    display_render_status("SYNC FAILED");
+#endif
+    return false;
+}
+
+static bool apply_alarm_sync_command(const cJSON *payload)
+{
+#ifndef CONFIG_FIGURE_ENABLE_SPEAKER
+    (void)payload;
+    return false;
+#else
+    const cJSON *revision = cJSON_GetObjectItemCaseSensitive(payload, "revision");
+    const cJSON *alarms = cJSON_GetObjectItemCaseSensitive(payload, "alarms");
+    if (!cJSON_IsString(revision) || revision->valuestring == NULL ||
+        strlen(revision->valuestring) >= 40 || !cJSON_IsArray(alarms) ||
+        cJSON_GetArraySize(alarms) > OFFLINE_ALARM_MAX_COUNT) {
+        ESP_LOGE(TAG, "Invalid offline alarm sync payload");
+        return false;
+    }
+    post_alarm_sync_event("alarm_sync_started", revision->valuestring,
+                          "底座正在缓存闹钟", 0);
+
+    offline_alarm_store_t next_store = {
+        .magic = OFFLINE_ALARM_STORE_MAGIC,
+        .version = OFFLINE_ALARM_STORE_VERSION,
+        .count = 0,
+    };
+    const cJSON *item;
+    cJSON_ArrayForEach(item, alarms) {
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(item, "id");
+        const cJSON *hour = cJSON_GetObjectItemCaseSensitive(item, "hour");
+        const cJSON *minute = cJSON_GetObjectItemCaseSensitive(item, "minute");
+        const cJSON *days_mask = cJSON_GetObjectItemCaseSensitive(item, "daysMask");
+        const cJSON *audio_path = cJSON_GetObjectItemCaseSensitive(item, "audioPath");
+        const cJSON *snooze_enabled =
+            cJSON_GetObjectItemCaseSensitive(item, "snoozeEnabled");
+        const cJSON *snooze_minutes =
+            cJSON_GetObjectItemCaseSensitive(item, "snoozeMinutes");
+        const cJSON *snooze_count =
+            cJSON_GetObjectItemCaseSensitive(item, "snoozeCount");
+        if (!cJSON_IsString(id) || id->valuestring == NULL ||
+            strlen(id->valuestring) >= sizeof(next_store.alarms[0].id) ||
+            !cJSON_IsNumber(hour) || hour->valueint < 0 || hour->valueint > 23 ||
+            !cJSON_IsNumber(minute) || minute->valueint < 0 || minute->valueint > 59 ||
+            !cJSON_IsNumber(days_mask) || days_mask->valueint < 1 ||
+            days_mask->valueint > 0x7f ||
+            !cJSON_IsString(audio_path) || audio_path->valuestring == NULL ||
+            !cJSON_IsNumber(snooze_minutes) || snooze_minutes->valueint < 1 ||
+            snooze_minutes->valueint > 60 ||
+            !cJSON_IsNumber(snooze_count) || snooze_count->valueint < 0 ||
+            snooze_count->valueint > 20) {
+            return fail_alarm_sync(revision->valuestring, "闹钟配置格式错误");
+        }
+
+        offline_alarm_t *alarm = &next_store.alarms[next_store.count];
+        strlcpy(alarm->id, id->valuestring, sizeof(alarm->id));
+        offline_alarm_cache_path(id->valuestring, alarm->audio_path,
+                                 sizeof(alarm->audio_path));
+        alarm->hour = (uint8_t)hour->valueint;
+        alarm->minute = (uint8_t)minute->valueint;
+        alarm->days_mask = (uint8_t)days_mask->valueint;
+        alarm->snooze_enabled = cJSON_IsTrue(snooze_enabled) ? 1U : 0U;
+        alarm->snooze_minutes = (uint8_t)snooze_minutes->valueint;
+        alarm->snooze_count = (uint8_t)snooze_count->valueint;
+        alarm->last_trigger_minute = -1;
+
+#ifdef CONFIG_FIGURE_ENABLE_DISPLAY
+        display_render_status("ALARM SYNC");
+#endif
+        if (!download_audio_to_file(audio_path->valuestring, alarm->audio_path)) {
+            ESP_LOGE(TAG, "Unable to cache alarm=%s", alarm->id);
+            return fail_alarm_sync(revision->valuestring, "铃声下载或格式校验失败");
+        }
+        next_store.count++;
+    }
+
+    if (xSemaphoreTake(offline_alarm_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        return fail_alarm_sync(revision->valuestring, "底座存储正忙，请稍后重试");
+    }
+    const offline_alarm_store_t previous_store = offline_alarm_store;
+    for (uint16_t index = 0; index < next_store.count; ++index) {
+        offline_alarm_t *alarm = &next_store.alarms[index];
+        const offline_alarm_t *saved =
+            find_saved_offline_alarm(&previous_store, alarm->id);
+        if (saved != NULL) {
+            alarm->last_trigger_minute = saved->last_trigger_minute;
+            alarm->snooze_at = saved->snooze_at;
+            alarm->snooze_used_count = saved->snooze_used_count;
+        }
+    }
+    offline_alarm_store = next_store;
+    const bool saved = save_offline_alarm_store();
+    if (!saved) offline_alarm_store = previous_store;
+    xSemaphoreGive(offline_alarm_mutex);
+    if (!saved) {
+        return fail_alarm_sync(revision->valuestring, "闹钟计划保存失败");
+    }
+
+    for (uint16_t index = 0; index < previous_store.count; ++index) {
+        if (!offline_alarm_store_uses_path(&next_store,
+                                           previous_store.alarms[index].audio_path)) {
+            remove(previous_store.alarms[index].audio_path);
+        }
+    }
+    ESP_LOGI(TAG, "Offline alarm schedule saved: %u alarm(s)", next_store.count);
+#ifdef CONFIG_FIGURE_ENABLE_DISPLAY
+    display_render_status("ALARM READY");
+#endif
+    post_alarm_sync_event("alarm_sync_completed", revision->valuestring,
+                          "闹钟已安全保存到底座", next_store.count);
+    return true;
+#endif
+}
+
+static bool schedule_active_alarm_snooze(void)
+{
+    if (active_alarm_id[0] == '\0' || offline_alarm_mutex == NULL) return false;
+    if (xSemaphoreTake(offline_alarm_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
+    bool scheduled = false;
+    const time_t now = time(NULL);
+    for (uint16_t index = 0; index < offline_alarm_store.count; ++index) {
+        offline_alarm_t *alarm = &offline_alarm_store.alarms[index];
+        if (strcmp(alarm->id, active_alarm_id) != 0) continue;
+        const bool below_limit = alarm->snooze_count == 0 ||
+                                 alarm->snooze_used_count < alarm->snooze_count;
+        if (alarm->snooze_enabled && below_limit && now > 1704067200) {
+            alarm->snooze_used_count++;
+            alarm->snooze_at = (int64_t)now + alarm->snooze_minutes * 60;
+            scheduled = save_offline_alarm_store();
+            ESP_LOGI(TAG, "Local alarm snoozed id=%s minutes=%u used=%u",
+                     alarm->id, alarm->snooze_minutes,
+                     alarm->snooze_used_count);
+        }
+        break;
+    }
+    xSemaphoreGive(offline_alarm_mutex);
+    return scheduled;
+}
+
 static bool apply_config_command(const cJSON *command)
 {
     const cJSON *type = cJSON_GetObjectItemCaseSensitive(command, "type");
@@ -2384,6 +2776,41 @@ static bool apply_config_command(const cJSON *command)
                                  true);
 #endif
         return save_string("character", character_id->valuestring);
+    }
+
+    if (strcmp(type->valuestring, "sync_alarms") == 0) {
+        return apply_alarm_sync_command(payload);
+    }
+
+    if (strcmp(type->valuestring, "control_alarm") == 0) {
+        const cJSON *action = cJSON_GetObjectItemCaseSensitive(payload, "action");
+        const cJSON *alarm_id = cJSON_GetObjectItemCaseSensitive(payload, "alarmId");
+        if (!cJSON_IsString(action) || action->valuestring == NULL ||
+            !cJSON_IsString(alarm_id) || alarm_id->valuestring == NULL ||
+            strlen(alarm_id->valuestring) >= sizeof(active_alarm_id)) {
+            return false;
+        }
+        if (strcmp(action->valuestring, "stop") == 0) {
+            playback_stop_requested = true;
+            ESP_LOGI(TAG, "APP requested alarm stop id=%s", alarm_id->valuestring);
+#ifdef CONFIG_FIGURE_ENABLE_DISPLAY
+            display_render_status("ALARM STOP");
+#endif
+            return true;
+        }
+        if (strcmp(action->valuestring, "snooze") == 0) {
+            strlcpy(active_alarm_id, alarm_id->valuestring,
+                    sizeof(active_alarm_id));
+            playback_stop_requested = true;
+            const bool scheduled = schedule_active_alarm_snooze();
+            ESP_LOGI(TAG, "APP requested alarm snooze id=%s local=%s",
+                     alarm_id->valuestring, scheduled ? "yes" : "no");
+#ifdef CONFIG_FIGURE_ENABLE_DISPLAY
+            display_render_status(scheduled ? "SNOOZE" : "SNOOZE LIMIT");
+#endif
+            return true;
+        }
+        return false;
     }
 
     if (strcmp(type->valuestring, "speak_text") == 0) {
@@ -2502,6 +2929,112 @@ static int fetch_commands(void)
     return status;
 }
 
+static void configure_time_sync(void)
+{
+    if (time_sync_initialized) return;
+    setenv("TZ", "CST-8", 1);
+    tzset();
+    const esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    const esp_err_t error = esp_netif_sntp_init(&config);
+    if (error == ESP_OK) {
+        time_sync_initialized = true;
+        ESP_LOGI(TAG, "SNTP initialized for Asia/Shanghai");
+    } else {
+        ESP_LOGW(TAG, "SNTP initialization failed: %s", esp_err_to_name(error));
+    }
+}
+
+static void play_offline_alarm(const offline_alarm_t *alarm,
+                               bool snooze_occurrence)
+{
+#ifdef CONFIG_FIGURE_ENABLE_SPEAKER
+    if (alarm == NULL || alarm->audio_path[0] == '\0') return;
+    strlcpy(active_alarm_id, alarm->id, sizeof(active_alarm_id));
+    device_set_state(DEVICE_STATE_ALARM);
+    ESP_LOGI(TAG, "Local alarm due id=%s occurrence=%s file=%s",
+             alarm->id, snooze_occurrence ? "snooze" : "scheduled",
+             alarm->audio_path);
+    const bool played = speaker_play_prompt_file(alarm->audio_path, portMAX_DELAY);
+    const bool stopped = playback_stop_requested;
+    post_device_event("alarm_playback_completed",
+                      !played ? "离线闹钟播放失败"
+                              : stopped ? "离线闹钟已停止"
+                                        : "离线闹钟播放完成",
+                      !played ? "failed"
+                              : stopped ? "stopped" : "completed");
+    bool pending_snooze = false;
+#ifdef CONFIG_FIGURE_ENABLE_CONTROL_BUTTONS
+    pending_snooze = (pending_button_events & DEVICE_BUTTON_EVENT_SNOOZE) != 0;
+#endif
+    if (!pending_snooze) active_alarm_id[0] = '\0';
+    device_set_state(DEVICE_STATE_IDLE);
+#else
+    (void)alarm;
+    (void)snooze_occurrence;
+#endif
+}
+
+static void offline_alarm_task(void *arg)
+{
+    (void)arg;
+    bool reported_waiting_for_time = false;
+    while (true) {
+        const time_t now = time(NULL);
+        if (now <= 1704067200) {
+            if (!reported_waiting_for_time && offline_alarm_store.count > 0) {
+                ESP_LOGW(TAG, "Offline alarms waiting for network time sync");
+                reported_waiting_for_time = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        if (reported_waiting_for_time) {
+            ESP_LOGI(TAG, "Network time ready: %lld", (long long)now);
+            reported_waiting_for_time = false;
+        }
+        if (device_state != DEVICE_STATE_IDLE || offline_alarm_mutex == NULL) {
+            vTaskDelay(pdMS_TO_TICKS(250));
+            continue;
+        }
+
+        struct tm local_time;
+        localtime_r(&now, &local_time);
+        const int64_t current_minute = (int64_t)now / 60;
+        offline_alarm_t due_alarm;
+        bool has_due_alarm = false;
+        bool snooze_occurrence = false;
+
+        if (xSemaphoreTake(offline_alarm_mutex, pdMS_TO_TICKS(250)) == pdTRUE) {
+            for (uint16_t index = 0; index < offline_alarm_store.count; ++index) {
+                offline_alarm_t *alarm = &offline_alarm_store.alarms[index];
+                const bool snooze_due = alarm->snooze_at > 0 &&
+                                         alarm->snooze_at <= (int64_t)now;
+                const bool scheduled_due =
+                    (alarm->days_mask & (1U << local_time.tm_wday)) != 0 &&
+                    alarm->hour == local_time.tm_hour &&
+                    alarm->minute == local_time.tm_min &&
+                    alarm->last_trigger_minute != current_minute;
+                if (!snooze_due && !scheduled_due) continue;
+
+                if (snooze_due) {
+                    alarm->snooze_at = 0;
+                    snooze_occurrence = true;
+                } else {
+                    alarm->last_trigger_minute = current_minute;
+                    alarm->snooze_at = 0;
+                    alarm->snooze_used_count = 0;
+                }
+                due_alarm = *alarm;
+                has_due_alarm = save_offline_alarm_store();
+                break;
+            }
+            xSemaphoreGive(offline_alarm_mutex);
+        }
+        if (has_due_alarm) play_offline_alarm(&due_alarm, snooze_occurrence);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
 static void figure_network_task(void *arg)
 {
     (void)arg;
@@ -2607,6 +3140,11 @@ void app_main(void)
         }
     }
 
+    configure_time_sync();
+    if (xTaskCreate(offline_alarm_task, "offline_alarm", 6144, NULL, 5,
+                    NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Unable to start offline alarm scheduler task");
+    }
     xTaskCreate(figure_network_task, "figure_network", 24576, NULL, 5,
                 &figure_network_task_handle);
 #ifdef CONFIG_FIGURE_ENABLE_NFC

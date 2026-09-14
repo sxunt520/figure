@@ -182,6 +182,7 @@ export class AlarmSoundService implements OnModuleInit {
     const alarms = await this.alarmRepository.find({
       where: { userId, soundId },
     });
+    const affectedDeviceIds = [...new Set(alarms.map((alarm) => alarm.deviceId))];
     if (alarms.length) await this.alarmRepository.remove(alarms);
     await this.soundRepository.remove(sound);
     const localFileIsSharedSource =
@@ -198,7 +199,12 @@ export class AlarmSoundService implements OnModuleInit {
       }
       await this.deleteCosObject(sound.sourceObjectKey);
     }
-    return { deleted: true, soundId, deletedAlarms: alarms.length };
+    return {
+      deleted: true,
+      soundId,
+      deletedAlarms: alarms.length,
+      affectedDeviceIds,
+    };
   }
 
   async readForUser(userId: string, soundId: string) {

@@ -106,6 +106,22 @@ export class DevicesController {
     return this.store.listDeviceCommands(request.user.id, deviceId);
   }
 
+  @Get(':deviceId/alarm-sync')
+  alarmSyncStatus(
+    @Req() request: UserRequest,
+    @Param('deviceId') deviceId: string,
+  ) {
+    return this.store.getAlarmSyncStatus(request.user.id, deviceId);
+  }
+
+  @Post(':deviceId/alarm-sync')
+  retryAlarmSync(
+    @Req() request: UserRequest,
+    @Param('deviceId') deviceId: string,
+  ) {
+    return this.store.retryAlarmSync(request.user.id, deviceId);
+  }
+
   @Get(':deviceId/events')
   listEvents(
     @Req() request: UserRequest,

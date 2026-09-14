@@ -372,6 +372,8 @@ export class DeviceCommandEntity {
       'play_reminder',
       'speak_text',
       'start_listening',
+      'sync_alarms',
+      'control_alarm',
       'set_volume',
     ],
   })

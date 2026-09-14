@@ -1,5 +1,6 @@
 import {
   Alarm,
+  AlarmSyncStatus,
   AlarmSound,
   Character,
   ConversationMessage,
@@ -207,6 +208,16 @@ export const api = {
 
   listDeviceEvents: (token: string, deviceId: string) =>
     request<DeviceEvent[]>(`/devices/${deviceId}/events`, {}, token),
+
+  getAlarmSyncStatus: (token: string, deviceId: string) =>
+    request<AlarmSyncStatus>(`/devices/${deviceId}/alarm-sync`, {}, token),
+
+  retryAlarmSync: (token: string, deviceId: string) =>
+    request<AlarmSyncStatus>(
+      `/devices/${deviceId}/alarm-sync`,
+      { method: 'POST', body: '{}' },
+      token,
+    ),
 
   listConversationMessages: (token: string, deviceId: string) =>
     request<ConversationMessage[]>(`/devices/${deviceId}/messages`, {}, token),

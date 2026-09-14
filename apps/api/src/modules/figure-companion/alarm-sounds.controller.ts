@@ -16,11 +16,15 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { UserAuthGuard, UserRequest } from './auth.guards';
 import { AlarmSoundService } from './alarm-sound.service';
 import { SynthesizeAlarmSoundDto } from './dto';
+import { StoreService } from './store.service';
 
 @Controller('alarm-sounds')
 @UseGuards(UserAuthGuard)
 export class AlarmSoundsController {
-  constructor(private readonly sounds: AlarmSoundService) {}
+  constructor(
+    private readonly sounds: AlarmSoundService,
+    private readonly store: StoreService,
+  ) {}
 
   @Get()
   list(@Req() request: UserRequest) {
@@ -68,10 +72,15 @@ export class AlarmSoundsController {
   }
 
   @Delete(':soundId')
-  delete(
+  async delete(
     @Req() request: UserRequest,
     @Param('soundId') soundId: string,
   ) {
-    return this.sounds.delete(request.user.id, soundId);
+    const result = await this.sounds.delete(request.user.id, soundId);
+    for (const deviceId of result.affectedDeviceIds) {
+      await this.store.queueAlarmSyncForDevice(deviceId, request.user.id);
+    }
+    const { affectedDeviceIds: _affectedDeviceIds, ...response } = result;
+    return response;
   }
 }

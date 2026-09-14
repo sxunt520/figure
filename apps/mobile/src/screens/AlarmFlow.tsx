@@ -23,7 +23,7 @@ import {
 import { Audio } from 'expo-av';
 import * as DocumentPicker from 'expo-document-picker';
 import { api, AlarmInput } from '../api';
-import { Alarm, AlarmSound, Device } from '../types';
+import { Alarm, AlarmSound, AlarmSyncStatus, Device } from '../types';
 
 const colors = {
   canvas: '#FFFFFF',
@@ -133,6 +133,7 @@ export function AlarmFlow({ token, device }: { token: string; device: Device | n
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [customSounds, setCustomSounds] = useState<AlarmSound[]>([]);
+  const [alarmSync, setAlarmSync] = useState<AlarmSyncStatus | null>(null);
 
   const loadAlarms = useCallback(async () => {
     if (!token || !device) {
@@ -153,6 +154,37 @@ export function AlarmFlow({ token, device }: { token: string; device: Device | n
   useEffect(() => {
     void loadAlarms();
   }, [loadAlarms]);
+
+  const loadAlarmSync = useCallback(async () => {
+    if (!token || !device) {
+      setAlarmSync(null);
+      return;
+    }
+    try {
+      setAlarmSync(await api.getAlarmSyncStatus(token, device.id));
+    } catch {
+      // Alarm list errors remain the primary connection error surface.
+    }
+  }, [device?.id, token]);
+
+  useEffect(() => {
+    void loadAlarmSync();
+    if (!token || !device) return;
+    const timer = setInterval(() => void loadAlarmSync(), 2500);
+    return () => clearInterval(timer);
+  }, [device?.id, loadAlarmSync, token]);
+
+  const markAlarmSyncPending = () => {
+    setAlarmSync((current) => ({
+      state: 'pending',
+      revision: current?.revision ?? null,
+      commandId: current?.commandId ?? null,
+      totalEnabled: current?.totalEnabled ?? alarms.filter((alarm) => alarm.enabled).length,
+      cachedCount: current?.cachedCount ?? 0,
+      message: '闹钟变更正在发送到底座',
+      updatedAt: new Date().toISOString(),
+    }));
+  };
 
   const loadSounds = useCallback(async () => {
     if (!token) {
@@ -229,6 +261,7 @@ export function AlarmFlow({ token, device }: { token: string; device: Device | n
     if (!token || !device) return false;
     setSaving(true);
     setError('');
+    markAlarmSyncPending();
     try {
       const input: AlarmInput = {
         deviceId: device.id,
@@ -256,8 +289,10 @@ export function AlarmFlow({ token, device }: { token: string; device: Device | n
           : [...current, saved];
       });
       setDraft({ ...saved });
+      void loadAlarmSync();
       return true;
     } catch (caught) {
+      void loadAlarmSync();
       const message = caught instanceof Error ? caught.message : '闹钟保存失败';
       setError(message);
       Alert.alert('保存失败', message);
@@ -270,12 +305,15 @@ export function AlarmFlow({ token, device }: { token: string; device: Device | n
   const toggleAlarm = async (alarmId: string, enabled: boolean) => {
     if (!token) return;
     const before = alarms;
+    markAlarmSyncPending();
     setAlarms((current) => current.map((alarm) => alarm.id === alarmId ? { ...alarm, enabled } : alarm));
     try {
       const updated = await api.updateAlarm(token, alarmId, { enabled });
       setAlarms((current) => current.map((alarm) => alarm.id === alarmId ? updated : alarm));
+      void loadAlarmSync();
     } catch (caught) {
       setAlarms(before);
+      void loadAlarmSync();
       const message = caught instanceof Error ? caught.message : '闹钟状态更新失败';
       setError(message);
       Alert.alert('操作失败', message);
@@ -285,14 +323,49 @@ export function AlarmFlow({ token, device }: { token: string; device: Device | n
   const deleteAlarm = async (alarmId: string) => {
     if (!token) return false;
     try {
+      markAlarmSyncPending();
       await api.deleteAlarm(token, alarmId);
       setAlarms((current) => current.filter((alarm) => alarm.id !== alarmId));
+      void loadAlarmSync();
       return true;
     } catch (caught) {
+      void loadAlarmSync();
       const message = caught instanceof Error ? caught.message : '闹钟删除失败';
       setError(message);
       Alert.alert('删除失败', message);
       return false;
+    }
+  };
+
+  const retryAlarmSync = async () => {
+    if (!token || !device) return;
+    markAlarmSyncPending();
+    try {
+      setAlarmSync(await api.retryAlarmSync(token, device.id));
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : '重新同步失败';
+      setError(message);
+      Alert.alert('重新同步失败', message);
+    }
+  };
+
+  const snoozeAlarm = async (alarmId: string) => {
+    if (!token) return;
+    try {
+      const updated = await api.snoozeAlarm(token, alarmId);
+      setAlarms((current) => current.map((alarm) => alarm.id === alarmId ? updated : alarm));
+    } catch (caught) {
+      Alert.alert('稍后提醒失败', caught instanceof Error ? caught.message : '请稍后重试');
+    }
+  };
+
+  const dismissAlarm = async (alarmId: string) => {
+    if (!token) return;
+    try {
+      const updated = await api.dismissAlarm(token, alarmId);
+      setAlarms((current) => current.map((alarm) => alarm.id === alarmId ? updated : alarm));
+    } catch (caught) {
+      Alert.alert('停止闹钟失败', caught instanceof Error ? caught.message : '请稍后重试');
     }
   };
 
@@ -312,11 +385,15 @@ export function AlarmFlow({ token, device }: { token: string; device: Device | n
             alarms={alarms}
             loading={loading}
             error={error}
+            alarmSync={alarmSync}
             onNew={beginNewAlarm}
             onEdit={editAlarm}
             onToggle={toggleAlarm}
             onDelete={deleteAlarm}
             onRetry={loadAlarms}
+            onRetrySync={retryAlarmSync}
+            onSnooze={snoozeAlarm}
+            onDismiss={dismissAlarm}
           />
         )}
       </Stack.Screen>
@@ -403,20 +480,28 @@ function AlarmHomeScreen({
   alarms,
   loading,
   error,
+  alarmSync,
   onNew,
   onEdit,
   onToggle,
   onDelete,
   onRetry,
+  onRetrySync,
+  onSnooze,
+  onDismiss,
 }: NativeStackScreenProps<AlarmStackParamList, 'AlarmHome'> & {
   alarms: AlarmItem[];
   loading: boolean;
   error: string;
+  alarmSync: AlarmSyncStatus | null;
   onNew: () => boolean;
   onEdit: (alarm: AlarmItem) => void;
   onToggle: (alarmId: string, enabled: boolean) => Promise<void>;
   onDelete: (alarmId: string) => Promise<boolean>;
   onRetry: () => Promise<void>;
+  onRetrySync: () => Promise<void>;
+  onSnooze: (alarmId: string) => Promise<void>;
+  onDismiss: (alarmId: string) => Promise<void>;
 }) {
   const [menuId, setMenuId] = useState<string | null>(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
@@ -465,6 +550,22 @@ function AlarmHomeScreen({
               <Text numberOfLines={1} style={styles.ringingSubtitle}>
                 {pad(ringingAlarm.hour)}:{pad(ringingAlarm.minute)} · {ringingAlarm.soundTitle}
               </Text>
+              <View style={styles.ringingActions}>
+                {ringingAlarm.snoozeEnabled ? (
+                  <Pressable
+                    style={styles.ringingSecondaryButton}
+                    onPress={() => void onSnooze(ringingAlarm.id)}
+                  >
+                    <Text style={styles.ringingSecondaryText}>稍后提醒</Text>
+                  </Pressable>
+                ) : null}
+                <Pressable
+                  style={styles.ringingPrimaryButton}
+                  onPress={() => void onDismiss(ringingAlarm.id)}
+                >
+                  <Text style={styles.ringingPrimaryText}>停止</Text>
+                </Pressable>
+              </View>
             </View>
           </View>
         ) : remaining ? (
@@ -482,13 +583,22 @@ function AlarmHomeScreen({
       {loading ? (
         <View style={styles.alarmStatusRow}>
           <ActivityIndicator color={colors.lime} />
-          <Text style={styles.alarmStatusText}>正在同步闹钟…</Text>
+          <Text style={styles.alarmStatusText}>正在加载闹钟…</Text>
         </View>
       ) : error ? (
         <Pressable style={styles.alarmErrorRow} onPress={() => void onRetry()}>
           <Text numberOfLines={2} style={styles.alarmErrorText}>{error}</Text>
           <Text style={styles.alarmRetryText}>点击重试</Text>
         </Pressable>
+      ) : null}
+
+      {alarmSync && (
+        alarms.length > 0
+        || alarmSync.state === 'pending'
+        || alarmSync.state === 'syncing'
+        || alarmSync.state === 'failed'
+      ) ? (
+        <AlarmSyncBanner status={alarmSync} onRetry={onRetrySync} />
       ) : null}
 
       <View style={styles.alarmList}>
@@ -596,6 +706,66 @@ function AlarmHomeScreen({
         }}
       />
     </Page>
+  );
+}
+
+function AlarmSyncBanner({
+  status,
+  onRetry,
+}: {
+  status: AlarmSyncStatus;
+  onRetry: () => Promise<void>;
+}) {
+  if (status.state === 'idle') {
+    return (
+      <View style={styles.syncBanner}>
+        <Text style={styles.syncIdleIcon}>○</Text>
+        <Text style={styles.syncBannerText}>闹钟尚未同步到底座</Text>
+        <Pressable onPress={() => void onRetry()}>
+          <Text style={styles.syncRetryText}>立即同步</Text>
+        </Pressable>
+      </View>
+    );
+  }
+  if (status.state === 'pending' || status.state === 'syncing') {
+    return (
+      <View style={styles.syncBanner}>
+        <ActivityIndicator size="small" color={colors.sand} />
+        <View style={styles.flex}>
+          <Text style={styles.syncBannerText}>
+            {status.state === 'syncing' ? '底座正在缓存铃声…' : '等待底座同步…'}
+          </Text>
+          <Text style={styles.syncBannerHint}>同步完成后可离线响铃</Text>
+        </View>
+      </View>
+    );
+  }
+  if (status.state === 'failed') {
+    return (
+      <View style={[styles.syncBanner, styles.syncBannerFailed]}>
+        <Text style={styles.syncFailedIcon}>×</Text>
+        <View style={styles.flex}>
+          <Text style={styles.syncFailedText}>同步失败</Text>
+          <Text numberOfLines={1} style={styles.syncBannerHint}>
+            {status.message || '请检查底座网络后重试'}
+          </Text>
+        </View>
+        <Pressable onPress={() => void onRetry()}>
+          <Text style={styles.syncRetryText}>重新同步</Text>
+        </Pressable>
+      </View>
+    );
+  }
+  return (
+    <View style={[styles.syncBanner, styles.syncBannerReady]}>
+      <Text style={styles.syncReadyIcon}>✓</Text>
+      <View style={styles.flex}>
+        <Text style={styles.syncReadyText}>已同步到底座</Text>
+        <Text style={styles.syncBannerHint}>
+          已安全保存 {status.cachedCount} 个闹钟，可离线响铃
+        </Text>
+      </View>
+    </View>
   );
 }
 
@@ -1533,10 +1703,15 @@ const styles = StyleSheet.create({
   screenTitle: { color: colors.ink, fontSize: 21, fontWeight: '500' },
   countdownRow: { minHeight: 82, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 7, flexWrap: 'wrap' },
   countdownHint: { color: colors.muted, fontSize: 15 },
-  ringingBanner: { width: '100%', minHeight: 66, borderRadius: 16, backgroundColor: '#FFF2F0', paddingHorizontal: 15, flexDirection: 'row', alignItems: 'center', gap: 12 },
+  ringingBanner: { width: '100%', minHeight: 94, borderRadius: 16, backgroundColor: '#FFF2F0', paddingHorizontal: 15, paddingVertical: 12, flexDirection: 'row', alignItems: 'center', gap: 12 },
   ringingIcon: { fontSize: 28 },
   ringingTitle: { color: colors.danger, fontSize: 17, fontWeight: '800' },
   ringingSubtitle: { color: '#8E625F', fontSize: 12, marginTop: 3 },
+  ringingActions: { flexDirection: 'row', gap: 8, marginTop: 9 },
+  ringingSecondaryButton: { minWidth: 74, height: 30, borderRadius: 15, borderWidth: 1, borderColor: '#DDA7A2', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 12 },
+  ringingSecondaryText: { color: '#A85750', fontSize: 12, fontWeight: '700' },
+  ringingPrimaryButton: { minWidth: 62, height: 30, borderRadius: 15, backgroundColor: colors.danger, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 12 },
+  ringingPrimaryText: { color: '#FFFFFF', fontSize: 12, fontWeight: '700' },
   countItem: { flexDirection: 'row', alignItems: 'flex-end', gap: 4 },
   countValue: { color: colors.ink, fontSize: 26, lineHeight: 32, borderBottomWidth: 2, borderBottomColor: colors.ink, fontWeight: '600' },
   countUnit: { color: colors.muted, fontSize: 15, marginBottom: 3 },
@@ -1546,6 +1721,17 @@ const styles = StyleSheet.create({
   alarmErrorRow: { minHeight: 48, borderRadius: 10, backgroundColor: '#FFF2F0', paddingHorizontal: 12, paddingVertical: 8, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 },
   alarmErrorText: { flex: 1, color: colors.danger, fontSize: 12 },
   alarmRetryText: { color: colors.danger, fontSize: 12, fontWeight: '700' },
+  syncBanner: { minHeight: 54, borderRadius: 13, backgroundColor: '#F8F4EA', paddingHorizontal: 13, paddingVertical: 9, marginBottom: 10, flexDirection: 'row', alignItems: 'center', gap: 10 },
+  syncBannerReady: { backgroundColor: '#F1F8E9' },
+  syncBannerFailed: { backgroundColor: '#FFF2F0' },
+  syncBannerText: { color: '#675C47', fontSize: 13, fontWeight: '700' },
+  syncBannerHint: { color: colors.muted, fontSize: 11, marginTop: 2 },
+  syncIdleIcon: { color: colors.sand, fontSize: 22, fontWeight: '700' },
+  syncReadyIcon: { width: 24, height: 24, borderRadius: 12, backgroundColor: colors.green, color: '#FFFFFF', textAlign: 'center', lineHeight: 24, fontSize: 15, fontWeight: '800' },
+  syncReadyText: { color: '#4C8F42', fontSize: 13, fontWeight: '800' },
+  syncFailedIcon: { width: 24, height: 24, borderRadius: 12, backgroundColor: colors.danger, color: '#FFFFFF', textAlign: 'center', lineHeight: 23, fontSize: 19, fontWeight: '700' },
+  syncFailedText: { color: colors.danger, fontSize: 13, fontWeight: '800' },
+  syncRetryText: { color: '#8C7447', fontSize: 12, fontWeight: '800' },
   alarmList: { gap: 16, marginTop: 5 },
   alarmCard: { minHeight: 120, backgroundColor: colors.cream, borderRadius: 17, padding: 16, flexDirection: 'row', alignItems: 'center' },
   alarmIconCircle: { width: 66, height: 66, borderRadius: 33, backgroundColor: colors.sand, alignItems: 'center', justifyContent: 'center' },

@@ -1157,6 +1157,8 @@ function formatBeijingTime(value: string | number | Date) {
 function formatCommandType(type: DeviceCommand['type']) {
   const labels: Record<DeviceCommand['type'], string> = {
     sync_character: '同步角色',
+    sync_alarms: '同步离线闹钟',
+    control_alarm: '控制闹钟',
     play_reminder: '播放提醒',
     speak_text: '测试播报',
     start_listening: '录音并识别',

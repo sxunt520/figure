@@ -6,7 +6,19 @@ export type CommandType =
   | 'play_reminder'
   | 'speak_text'
   | 'start_listening'
+  | 'sync_alarms'
+  | 'control_alarm'
   | 'set_volume';
+
+export interface AlarmSyncStatus {
+  state: 'idle' | 'pending' | 'syncing' | 'synced' | 'failed';
+  revision: string | null;
+  commandId: string | null;
+  totalEnabled: number;
+  cachedCount: number;
+  message: string | null;
+  updatedAt: string | null;
+}
 
 export interface User {
   id: string;

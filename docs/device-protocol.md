@@ -55,6 +55,8 @@ GET /device/commands
 | `set_volume` | 调节输出音量 | `volume` |
 | `speak_text` | 下载并播报角色语音 | `text`, `voiceId`, `audioPath`, `audioFormat`, `sampleRate` |
 | `play_reminder` | 触发闹钟或角色语音提醒 | `kind`, `title`, `voiceId`, `audioPath`, `audioFormat`, `sampleRate` |
+| `sync_alarms` | 保存完整离线闹钟计划并预缓存铃声 | `revision`, `timezone`, `alarms[]` |
+| `control_alarm` | 远程停止当前闹钟或进入稍后提醒 | `action`, `alarmId` |
 | `start_listening` | VAD 录音并提交短语音识别 | `durationMs`, `stopMode`, `sampleRate`, `format`, `source` |
 
 设备只有在执行成功或已经安全保存指令后才进行 ACK。
@@ -63,6 +65,20 @@ GET /device/commands
 `/audio/550e8400-e29b-41d4-a716-446655440000.wav`。设备使用同一个
 `deviceAccessToken` 下载该 WAV；当前固件支持 8～48 kHz、16-bit PCM、单声道或双声道，
 最大 8 MB。设备完成播放后才 ACK，下载或播放失败时保留指令等待重试。
+
+`sync_alarms` 是完整快照，不是增量更新。每个条目包含 `id`、`hour`、`minute`、
+`daysMask`、`snoozeEnabled`、`snoozeMinutes`、`snoozeCount` 和 `audioPath`。
+固件先把全部 WAV 下载到 SPIFFS，随后一次性替换 NVS 中的计划并 ACK；任何下载失败
+都保留旧计划并等待下一轮重试。0.8 及以上固件使用 SNTP 校准北京时间，在底座本地
+到点播放，后端只维护状态，不再重复下发 `play_reminder`。当前最多同步 8 个启用闹钟。
+
+底座按 `revision` 回传 `alarm_sync_started`、`alarm_sync_completed` 或
+`alarm_sync_failed` 事件；成功事件包含 `cachedCount`，失败事件包含可展示给
+用户的 `message`。APP 可通过 `GET /devices/<deviceId>/alarm-sync` 查询真实
+同步状态，或通过 `POST /devices/<deviceId>/alarm-sync` 重新下发完整快照。
+
+`control_alarm.action` 支持 `stop` 和 `snooze`。该指令只控制当前响铃，
+不修改闹钟本身的启用状态。
 
 ## 4. 确认指令
 

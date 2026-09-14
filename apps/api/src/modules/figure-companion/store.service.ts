@@ -9,8 +9,15 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { createHash, randomUUID } from 'crypto';
-import { IsNull, LessThanOrEqual, Repository } from 'typeorm';
-import { Alarm, Character, ConversationMessage, DeviceView, User } from './contracts';
+import { In, IsNull, LessThanOrEqual, Repository } from 'typeorm';
+import {
+  Alarm,
+  AlarmSyncStatus,
+  Character,
+  ConversationMessage,
+  DeviceView,
+  User,
+} from './contracts';
 import {
   BindDeviceDto,
   CreateAlarmDto,
@@ -335,6 +342,81 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
+  async getAlarmSyncStatus(
+    userId: string,
+    deviceId: string,
+  ): Promise<AlarmSyncStatus> {
+    await this.requireOwnedDevice(userId, deviceId);
+    const command = await this.commandRepository.findOne({
+      where: { deviceId, type: 'sync_alarms' },
+      order: { createdAt: 'DESC' },
+    });
+    if (!command) {
+      return {
+        state: 'idle',
+        revision: null,
+        commandId: null,
+        totalEnabled: 0,
+        cachedCount: 0,
+        message: null,
+        updatedAt: null,
+      };
+    }
+
+    const revision = typeof command.payload.revision === 'string'
+      ? command.payload.revision
+      : null;
+    const totalEnabled = typeof command.payload.totalEnabled === 'number'
+      ? command.payload.totalEnabled
+      : 0;
+    const events = revision
+      ? await this.eventRepository.find({
+          where: {
+            deviceId,
+            type: In([
+              'alarm_sync_started',
+              'alarm_sync_completed',
+              'alarm_sync_failed',
+            ]),
+          },
+          order: { createdAt: 'DESC' },
+          take: 30,
+        })
+      : [];
+    const event = events.find((item) => item.payload.revision === revision);
+    const cachedCount = event && typeof event.payload.cachedCount === 'number'
+      ? event.payload.cachedCount
+      : command.acknowledgedAt ? totalEnabled : 0;
+    const message = event && typeof event.payload.message === 'string'
+      ? event.payload.message
+      : null;
+    const state: AlarmSyncStatus['state'] = event?.type === 'alarm_sync_completed'
+      ? 'synced'
+      : command.acknowledgedAt
+      ? 'synced'
+      : event?.type === 'alarm_sync_failed'
+        ? 'failed'
+        : event?.type === 'alarm_sync_started'
+          ? 'syncing'
+          : 'pending';
+    return {
+      state,
+      revision,
+      commandId: command.id,
+      totalEnabled,
+      cachedCount,
+      message,
+      updatedAt: (event?.createdAt ?? command.acknowledgedAt ?? command.createdAt)
+        .toISOString(),
+    };
+  }
+
+  async retryAlarmSync(userId: string, deviceId: string) {
+    await this.requireOwnedDevice(userId, deviceId);
+    await this.queueAlarmSyncForDevice(deviceId, userId);
+    return this.getAlarmSyncStatus(userId, deviceId);
+  }
+
   async listConversationMessages(
     userId: string,
     deviceId: string,
@@ -434,7 +516,9 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       lastTriggeredAt: null,
     });
     alarm.nextTriggeredAt = this.nextAlarmOccurrence(alarm, new Date());
-    return this.toAlarm(await this.alarmRepository.save(alarm));
+    const saved = await this.alarmRepository.save(alarm);
+    await this.queueAlarmSyncForDevice(saved.deviceId, userId);
+    return this.toAlarm(saved);
   }
 
   async updateAlarm(
@@ -479,7 +563,9 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       alarm.ringingStartedAt = null;
     }
 
-    return this.toAlarm(await this.alarmRepository.save(alarm));
+    const saved = await this.alarmRepository.save(alarm);
+    await this.queueAlarmSyncForDevice(saved.deviceId, userId);
+    return this.toAlarm(saved);
   }
 
   async snoozeAlarm(userId: string, alarmId: string): Promise<Alarm> {
@@ -493,6 +579,10 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
         : '这个闹钟没有开启稍后提醒';
       throw new BadRequestException(reason);
     }
+    await this.enqueueCommand(device.id, 'control_alarm', {
+      action: 'snooze',
+      alarmId: alarm.id,
+    });
     return this.toAlarm(await this.requireAlarm(userId, alarmId));
   }
 
@@ -504,13 +594,20 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     alarm.lastDismissedAt = new Date();
     this.alarmRetryAfter.delete(alarm.id);
     await this.cancelPendingAlarmCommands(alarm);
-    return this.toAlarm(await this.alarmRepository.save(alarm));
+    const saved = await this.alarmRepository.save(alarm);
+    await this.enqueueCommand(alarm.deviceId, 'control_alarm', {
+      action: 'stop',
+      alarmId: alarm.id,
+    });
+    return this.toAlarm(saved);
   }
 
   async deleteAlarm(userId: string, alarmId: string) {
     const alarm = await this.requireAlarm(userId, alarmId);
+    const deviceId = alarm.deviceId;
     await this.cancelPendingAlarmCommands(alarm);
     await this.alarmRepository.remove(alarm);
+    await this.queueAlarmSyncForDevice(deviceId, userId);
     return { deleted: true, alarmId };
   }
 
@@ -542,10 +639,24 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
   }
 
   async heartbeat(device: DeviceEntity, dto: HeartbeatDto) {
+    const firmwareChanged = Boolean(
+      dto.firmwareVersion && dto.firmwareVersion !== device.firmwareVersion,
+    );
     device.lastSeenAt = new Date();
     if (dto.firmwareVersion) device.firmwareVersion = dto.firmwareVersion;
     if (dto.volume !== undefined) device.volume = dto.volume;
     await this.deviceRepository.save(device);
+    if (firmwareChanged && device.ownerUserId) {
+      void this.queueAlarmSyncForDevice(device.id, device.ownerUserId).catch(
+        (error) => {
+          this.logger.warn(
+            `Unable to queue alarm sync after firmware change device=${device.id}: ${
+              error instanceof Error ? error.message : 'unknown error'
+            }`,
+          );
+        },
+      );
+    }
     return {
       serverTime: new Date().toISOString(),
       bound: Boolean(device.ownerUserId),
@@ -718,7 +829,7 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
         if (type === 'alarm_playback_started') {
           alarm.lifecycleStatus = 'ringing';
           alarm.ringingStartedAt = new Date();
-        } else {
+        } else if (alarm.lifecycleStatus !== 'snoozing') {
           alarm.lifecycleStatus = 'scheduled';
           alarm.ringingStartedAt = null;
           alarm.lastDismissedAt = new Date();
@@ -967,6 +1078,71 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
+  async queueAlarmSyncForDevice(deviceId: string, userId: string) {
+    const device = await this.deviceRepository.findOne({
+      where: { id: deviceId, ownerUserId: userId },
+    });
+    if (!device) return null;
+
+    const alarms = await this.alarmRepository.find({
+      where: { deviceId, userId, enabled: true },
+      order: { nextTriggeredAt: 'ASC', createdAt: 'ASC' },
+    });
+    const character = device.characterId
+      ? await this.characterRepository.findOne({ where: { id: device.characterId } })
+      : null;
+    const syncedAlarms: Record<string, unknown>[] = [];
+
+    for (const alarm of alarms.slice(0, 8)) {
+      let audioPath: string;
+      if (!alarm.useThemeSound && alarm.soundId) {
+        // Stable, device-authenticated URL. The service restores the local copy
+        // from COS when necessary, so firmware can retry until it is cached.
+        audioPath = `/audio/alarm/${alarm.soundId}`;
+      } else {
+        const speech = await this.tts.synthesize(
+          this.alarmSpeechText(alarm),
+          character?.voiceId,
+          character?.ttsModel,
+        );
+        audioPath = speech.audioPath;
+      }
+      const daysMask = alarm.days.reduce(
+        (mask, day) => mask | (1 << day),
+        0,
+      );
+      syncedAlarms.push({
+        id: alarm.id,
+        hour: alarm.hour,
+        minute: alarm.minute,
+        daysMask,
+        snoozeEnabled: alarm.snoozeEnabled,
+        snoozeMinutes: alarm.snoozeMinutes,
+        snoozeCount: alarm.snoozeCount,
+        title: alarm.soundTitle,
+        audioPath,
+      });
+    }
+
+    await this.commandRepository.delete({
+      deviceId,
+      type: 'sync_alarms',
+      acknowledgedAt: IsNull(),
+    });
+    const command = await this.enqueueCommand(deviceId, 'sync_alarms', {
+      revision: randomUUID(),
+      timezone: 'Asia/Shanghai',
+      generatedAt: new Date().toISOString(),
+      totalEnabled: alarms.length,
+      truncated: alarms.length > syncedAlarms.length,
+      alarms: syncedAlarms,
+    });
+    this.logger.log(
+      `Queued offline alarm sync device=${deviceId} alarms=${syncedAlarms.length}`,
+    );
+    return command;
+  }
+
   private async enqueueNfcWelcome(
     deviceId: string,
     character: CharacterEntity,
@@ -1099,6 +1275,34 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
           where: { id: alarm.deviceId, ownerUserId: alarm.userId },
         });
         if (!device) continue;
+        const occurrence = snoozeDue && !scheduledDue ? 'snooze' : 'scheduled';
+
+        if (this.supportsOfflineAlarmScheduler(device.firmwareVersion)) {
+          alarm.lastTriggeredAt = now;
+          alarm.lifecycleStatus = 'ringing';
+          alarm.ringingStartedAt = now;
+          if (snoozeDue) alarm.snoozeScheduledAt = null;
+          if (occurrence === 'scheduled') {
+            alarm.snoozeUsedCount = 0;
+            alarm.snoozeScheduledAt = null;
+            alarm.nextTriggeredAt = this.nextAlarmOccurrence(alarm, now);
+          }
+          await this.alarmRepository.save(alarm);
+          await this.eventRepository.save(
+            this.eventRepository.create({
+              deviceId: device.id,
+              type: 'alarm_local_trigger_expected',
+              payload: {
+                alarmId: alarm.id,
+                title: alarm.soundTitle,
+                occurrence,
+                nextTriggeredAt: alarm.nextTriggeredAt?.toISOString() ?? null,
+              },
+            }),
+          );
+          this.alarmRetryAfter.delete(alarm.id);
+          continue;
+        }
         const character = device.characterId
           ? await this.characterRepository.findOne({ where: { id: device.characterId } })
           : null;
@@ -1115,7 +1319,6 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
                 character?.voiceId,
                 character?.ttsModel,
               );
-          const occurrence = snoozeDue && !scheduledDue ? 'snooze' : 'scheduled';
           const command = await this.enqueueCommand(device.id, 'play_reminder', {
             alarmId: alarm.id,
             title: alarm.soundTitle,
@@ -1184,6 +1387,14 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       return '早上好，该起床啦。今天也要元气满满哦。';
     }
     return alarm.soundTitle;
+  }
+
+  private supportsOfflineAlarmScheduler(firmwareVersion: string) {
+    const match = /^(\d+)\.(\d+)/.exec(firmwareVersion);
+    if (!match) return false;
+    const major = Number(match[1]);
+    const minor = Number(match[2]);
+    return major > 0 || minor >= 8;
   }
 
   private nextAlarmOccurrence(alarm: AlarmEntity, after: Date) {

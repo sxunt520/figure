@@ -8,6 +8,8 @@
     "start:go": "expo start --go",
     "android": "expo run:android",
     "android:build": "expo run:android",
+    "logs:android": "bash scripts/android-logs.sh app",
+    "logs:android:crash": "bash scripts/android-logs.sh crash",
     "ios": "expo run:ios",
     "web": "expo start --web",
     "typecheck": "tsc --noEmit"
