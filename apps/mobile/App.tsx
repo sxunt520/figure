@@ -1,5 +1,5 @@
 import { StatusBar } from 'expo-status-bar';
-import { NavigationContainer, getFocusedRouteNameFromRoute } from '@react-navigation/native';
+import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
@@ -22,7 +22,6 @@ import {
   saveApiBaseUrl,
 } from './src/api';
 import { FigureFlow } from './src/screens/FigureFlow';
-import { AlarmFlow } from './src/screens/AlarmFlow';
 import { palette } from './src/theme';
 import {
   Character,
@@ -36,18 +35,14 @@ import {
 
 type RootTabParamList = {
   AI手办: undefined;
-  AI闹钟: undefined;
   设备: undefined;
-  绑定: undefined;
   提醒: undefined;
 };
 
 const Tabs = createBottomTabNavigator<RootTabParamList>();
 const tabIcons: Record<keyof RootTabParamList, string> = {
   AI手办: '◉',
-  AI闹钟: '◷',
   设备: '⌁',
-  绑定: '⌘',
   提醒: '◷',
 };
 
@@ -165,12 +160,9 @@ export default function App() {
     <NavigationContainer>
       <StatusBar style="dark" />
       <Tabs.Navigator
-        initialRouteName="AI手办"
+        initialRouteName="设备"
         screenOptions={({ route }) => {
-          const nestedRoute = getFocusedRouteNameFromRoute(route);
-          const hideTabBar =
-            (route.name === 'AI手办' && nestedRoute != null && nestedRoute !== 'FigureHome') ||
-            (route.name === 'AI闹钟' && nestedRoute != null && nestedRoute !== 'AlarmHome');
+          const hideTabBar = route.name === 'AI手办';
           return {
             headerShown: false,
             tabBarActiveTintColor: palette.primaryDark,
@@ -193,16 +185,15 @@ export default function App() {
         }}
       >
         <Tabs.Screen name="AI手办">
-          {() => (
+          {({ navigation }) => (
             <FigureFlow
               device={device}
+              messages={messages}
               token={token}
               onDeviceChanged={refresh}
+              onExit={() => navigation.navigate('设备')}
             />
           )}
-        </Tabs.Screen>
-        <Tabs.Screen name="AI闹钟">
-          {() => <AlarmFlow token={token} device={device} />}
         </Tabs.Screen>
         <Tabs.Screen name="设备">
           {({ navigation }) => (
@@ -223,26 +214,7 @@ export default function App() {
                 apiBaseUrl={apiBaseUrl}
                 onBackendChanged={handleBackendChanged}
                 onAction={perform}
-                onNeedBind={() => navigation.navigate('绑定')}
-              />
-            </DebugScreenFrame>
-          )}
-        </Tabs.Screen>
-        <Tabs.Screen name="绑定">
-          {({ navigation }) => (
-            <DebugScreenFrame
-              title="绑定调试"
-              userName={user?.displayName}
-              busy={busy}
-              error={error}
-              onClearError={() => setError('')}
-            >
-              <BindScreen
-                token={token}
-                device={device}
-                characters={characters}
-                onAction={perform}
-                onBound={() => navigation.navigate('设备')}
+                onNeedBind={() => navigation.navigate('AI手办')}
               />
             </DebugScreenFrame>
           )}

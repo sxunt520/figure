@@ -10,6 +10,8 @@ import {
   ImageBackground,
   ImageSourcePropType,
   Modal,
+  PanResponder,
+  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -375,6 +377,8 @@ export function AlarmFlow({ token, device }: { token: string; device: Device | n
       screenOptions={{
         headerShown: false,
         animation: 'slide_from_right',
+        gestureEnabled: true,
+        fullScreenGestureEnabled: false,
         contentStyle: { backgroundColor: colors.canvas },
       }}
     >
@@ -539,8 +543,8 @@ function AlarmHomeScreen({
   const deleting = alarms.find((alarm) => alarm.id === deleteId);
 
   return (
-    <Page scroll>
-      <ScreenHeader title="AI闹钟" />
+    <Page scroll onSwipeBack={navigation.goBack}>
+      <ScreenHeader title="AI闹钟" onBack={navigation.goBack} />
       <View style={styles.countdownRow}>
         {ringingAlarm ? (
           <View style={styles.ringingBanner}>
@@ -797,7 +801,7 @@ function AlarmEditorScreen({
   };
 
   return (
-    <Page scroll>
+    <Page scroll onSwipeBack={navigation.goBack}>
       <ScreenHeader title="设置闹钟" onBack={navigation.goBack} />
       <View style={styles.timePanel}>
         <Text style={styles.ringAfter}>闹钟会在 {formatDelay(draft.hour, draft.minute)} 后响铃</Text>
@@ -908,7 +912,7 @@ function AlarmFrequencyScreen({
   setDraft: React.Dispatch<React.SetStateAction<AlarmDraft>>;
 }) {
   return (
-    <Page scroll>
+    <Page scroll onSwipeBack={navigation.goBack}>
       <ScreenHeader title="闹钟频次" onBack={navigation.goBack} />
       <View style={styles.settingCard}>
         <View style={styles.switchTitleRow}>
@@ -967,7 +971,7 @@ function ThemePickerScreen({
   const theme = themes[index];
   const [includeAudio, setIncludeAudio] = useState(draft.useThemeSound);
   return (
-    <Page scroll>
+    <Page scroll onSwipeBack={navigation.goBack}>
       <ScreenHeader title="音效" onBack={navigation.goBack} />
       <View style={styles.themePickerWrap}>
         <ThemeHero theme={theme} showSound={includeAudio} />
@@ -1078,7 +1082,7 @@ function AlarmPreviewScreen({
   };
 
   return (
-    <Page scroll>
+    <Page scroll onSwipeBack={navigation.goBack}>
       <ScreenHeader title="预览闹钟" onBack={navigation.goBack} />
       <View style={styles.previewWrap}>
         <ThemeHero theme={theme} showSound />
@@ -1137,7 +1141,7 @@ function CustomSoundsScreen({
   const filtered = sounds.filter((sound) => sound.kind === tab);
   const deleting = sounds.find((sound) => sound.id === deleteId);
   return (
-    <Page>
+    <Page onSwipeBack={navigation.goBack}>
       <ScreenHeader title="自定义闹铃" onBack={navigation.goBack} />
       <View style={styles.soundTabs}>
         <SegmentButton label="♩  录音" active={tab === 'recording'} onPress={() => setTab('recording')} />
@@ -1354,12 +1358,17 @@ function RecordSoundScreen({
       setUploading(false);
     }
   };
+  const leaveRecording = () => {
+    if (recording) {
+      void recording.stopAndUnloadAsync();
+      setRecording(null);
+      void Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+    }
+    navigation.goBack();
+  };
   return (
-    <Page>
-      <ScreenHeader title="录制铃声" onBack={() => {
-        if (recording) void recording.stopAndUnloadAsync();
-        navigation.goBack();
-      }} />
+    <Page onSwipeBack={leaveRecording}>
+      <ScreenHeader title="录制铃声" onBack={leaveRecording} />
       <View style={styles.recordingCard}>
         <Text style={styles.recordingTitle}>{uploading ? '正在上传' : recording ? '正在录制' : '准备录制'}</Text>
         <Text style={styles.recordingHint}>建议录制 10～20 秒连续、清晰、无背景音乐的人声</Text>
@@ -1402,7 +1411,7 @@ function SoundCopyScreen({
   const [backgroundMusicId, setBackgroundMusicId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   return (
-    <Page scroll>
+    <Page scroll onSwipeBack={navigation.goBack}>
       <ScreenHeader title="编辑闹钟文案" onBack={navigation.goBack} />
       <View style={styles.sourceBadge}>
         <Text style={styles.sourceBadgeLabel}>{route.params.sourceKind === 'file' ? '已导入文件' : '已完成录音'}</Text>
@@ -1520,8 +1529,8 @@ function SynthesizingScreen({
   }, [completed, done, onComplete, sound]);
   const labels = ['正在准备音色复刻', '正在生成专属音色', '正在合成闹铃语音', '正在制作最终铃声'];
   return (
-    <Page>
-      <ScreenHeader title="DIY闹铃合成" onBack={done || failed ? navigation.goBack : undefined} />
+    <Page onSwipeBack={navigation.goBack}>
+      <ScreenHeader title="DIY闹铃合成" onBack={navigation.goBack} />
       <View style={styles.synthCenter}>
         {done ? <Text style={styles.doneIcon}>✓</Text> : failed ? <Text style={[styles.doneIcon, { color: colors.danger }]}>!</Text> : <ActivityIndicator size="large" color={colors.lime} />}
         <Text style={styles.synthTitle}>{done ? '铃声生成完成' : failed ? '铃声生成失败' : '您的铃声正在合成中，请稍等'}</Text>
@@ -1540,17 +1549,67 @@ function SynthesizingScreen({
   );
 }
 
-function Page({ children, scroll = false }: { children: React.ReactNode; scroll?: boolean }) {
-  if (scroll) {
-    return (
-      <SafeAreaView style={styles.safeArea}>
+function Page({
+  children,
+  scroll = false,
+  onSwipeBack,
+}: {
+  children: React.ReactNode;
+  scroll?: boolean;
+  onSwipeBack?: () => void;
+}) {
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      {scroll ? (
         <ScrollView contentContainerStyle={styles.scrollPage} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
           {children}
         </ScrollView>
-      </SafeAreaView>
-    );
-  }
-  return <SafeAreaView style={styles.safeArea}><View style={styles.page}>{children}</View></SafeAreaView>;
+      ) : (
+        <View style={styles.page}>{children}</View>
+      )}
+      {Platform.OS === 'android' && onSwipeBack ? <EdgeSwipeBack onBack={onSwipeBack} /> : null}
+    </SafeAreaView>
+  );
+}
+
+function EdgeSwipeBack({ onBack }: { onBack: () => void }) {
+  const [dragDistance, setDragDistance] = useState(0);
+  const onBackRef = useRef(onBack);
+  onBackRef.current = onBack;
+  const responder = useMemo(
+    () => PanResponder.create({
+      onStartShouldSetPanResponder: () => false,
+      onMoveShouldSetPanResponder: (_event, gesture) =>
+        gesture.dx > 8 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.35,
+      onPanResponderMove: (_event, gesture) => {
+        setDragDistance(Math.max(0, Math.min(96, gesture.dx)));
+      },
+      onPanResponderRelease: (_event, gesture) => {
+        const shouldGoBack = gesture.dx >= 68 || (gesture.dx >= 34 && gesture.vx >= 0.55);
+        setDragDistance(0);
+        if (shouldGoBack) onBackRef.current();
+      },
+      onPanResponderTerminate: () => setDragDistance(0),
+      onPanResponderTerminationRequest: () => false,
+    }),
+    [],
+  );
+  return (
+    <View style={styles.edgeSwipeZone} {...responder.panHandlers}>
+      <View
+        pointerEvents="none"
+        style={[
+          styles.edgeSwipeHint,
+          {
+            opacity: Math.min(1, dragDistance / 36),
+            transform: [{ translateX: Math.min(32, dragDistance * 0.35) }],
+          },
+        ]}
+      >
+        <Text style={styles.edgeSwipeHintText}>‹</Text>
+      </View>
+    </View>
+  );
 }
 
 function ScreenHeader({ title, onBack }: { title: string; onBack?: () => void }) {
@@ -1701,6 +1760,9 @@ const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: colors.canvas },
   page: { flex: 1, paddingHorizontal: 18 },
   scrollPage: { flexGrow: 1, paddingHorizontal: 18, paddingBottom: 28 },
+  edgeSwipeZone: { position: 'absolute', left: 0, top: 0, bottom: 0, width: 26, zIndex: 1000, justifyContent: 'center' },
+  edgeSwipeHint: { width: 44, height: 44, marginLeft: -22, borderRadius: 22, backgroundColor: 'rgba(17, 17, 17, 0.72)', alignItems: 'flex-end', justifyContent: 'center', paddingRight: 7 },
+  edgeSwipeHintText: { color: '#FFFFFF', fontSize: 35, lineHeight: 38, fontWeight: '300' },
   flex: { flex: 1 },
   screenHeader: { height: 72, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   backSlot: { width: 42, height: 42, alignItems: 'flex-start', justifyContent: 'center' },
