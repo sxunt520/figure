@@ -44,5 +44,5 @@ direct_dependencies:
 - espressif/led_strip
 - espressif/network_provisioning
 manifest_hash: c10e4842d8ed19f4a25305f01c363458cf95cf99d41147eda87df36e67ab543a
-target: esp32s3
+target: esp32
 version: 3.0.0
