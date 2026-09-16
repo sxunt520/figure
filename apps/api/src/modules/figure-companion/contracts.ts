@@ -30,6 +30,7 @@ export interface Character {
   name: string;
   description: string;
   accentColor: string;
+  backgroundImageUrl: string | null;
   voiceId: string;
   ttsModel: string;
   greeting: string;

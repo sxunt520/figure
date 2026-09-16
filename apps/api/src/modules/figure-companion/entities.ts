@@ -41,6 +41,9 @@ export class CharacterEntity {
   @Column({ type: 'varchar', length: 16 })
   accentColor: string;
 
+  @Column({ type: 'varchar', length: 1000, nullable: true })
+  backgroundImageUrl: string | null;
+
   @Column({ type: 'varchar', length: 160 })
   voiceId: string;
 

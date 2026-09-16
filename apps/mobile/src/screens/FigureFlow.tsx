@@ -2,13 +2,19 @@ import {
   NativeStackScreenProps,
   createNativeStackNavigator,
 } from '@react-navigation/native-stack';
-import React, { useCallback, useEffect, useState } from 'react';
+import { useIsFocused } from '@react-navigation/native';
+import { StatusBar } from 'expo-status-bar';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { BarcodeScanningResult, CameraView, useCameraPermissions } from 'expo-camera';
 import {
   ActivityIndicator,
   Alert,
   AppState,
+  Clipboard,
+  ImageBackground,
+  ImageSourcePropType,
   Pressable,
+  SafeAreaView,
   ScrollView,
   StyleSheet,
   Switch,
@@ -16,9 +22,15 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { Device } from '../types';
-import { api, getApiBaseUrl } from '../api';
+import { ConversationMessage, Device } from '../types';
+import {
+  api,
+  getApiBaseUrl,
+  normalizeApiBaseUrl,
+  saveApiBaseUrl,
+} from '../api';
 import { palette } from '../theme';
+import { AlarmFlow } from './AlarmFlow';
 import {
   DEVELOPMENT_DESCRIPTOR,
   ProvisioningEnvironment,
@@ -34,6 +46,10 @@ type SetupMode = 'add' | 'wifi';
 
 type FigureStackParamList = {
   FigureHome: undefined;
+  DeviceHome: undefined;
+  AlarmCenter: undefined;
+  ConversationHistory: undefined;
+  MoodDiary: undefined;
   BasePreparation: undefined;
   EnvironmentCheck: undefined;
   AddIntro: undefined;
@@ -50,15 +66,80 @@ type FigureStackParamList = {
 };
 
 const Stack = createNativeStackNavigator<FigureStackParamList>();
+const sukiMorningImage = require('../../assets/alarm/suki-morning.png');
+const niannianHomeImage = require('../../assets/figure/niannian-home.png');
+const suRuanruanHomeImage = require('../../assets/figure/su-ruanruan-home.png');
 
 export function FigureFlow({
   device,
+  messages,
   token,
+  onDeviceChanged,
+  onExit,
+}: {
+  device: Device | null;
+  messages: ConversationMessage[];
+  token: string;
+  onDeviceChanged: () => Promise<void>;
+  onExit: () => void;
+}) {
+  return (
+    <FigureStack
+      initialRouteName="FigureHome"
+      device={device}
+      messages={messages}
+      token={token}
+      onDeviceChanged={onDeviceChanged}
+      onExit={onExit}
+    />
+  );
+}
+
+export function DeviceFlow({
+  device,
+  token,
+  apiBaseUrl,
+  onBackendChanged,
   onDeviceChanged,
 }: {
   device: Device | null;
   token: string;
+  apiBaseUrl: string;
+  onBackendChanged: () => Promise<void>;
   onDeviceChanged: () => Promise<void>;
+}) {
+  return (
+    <FigureStack
+      initialRouteName="DeviceHome"
+      device={device}
+      messages={[]}
+      token={token}
+      apiBaseUrl={apiBaseUrl}
+      onBackendChanged={onBackendChanged}
+      onDeviceChanged={onDeviceChanged}
+      onExit={() => undefined}
+    />
+  );
+}
+
+function FigureStack({
+  initialRouteName,
+  device,
+  messages,
+  token,
+  apiBaseUrl = getApiBaseUrl(),
+  onBackendChanged,
+  onDeviceChanged,
+  onExit,
+}: {
+  initialRouteName: 'FigureHome' | 'DeviceHome';
+  device: Device | null;
+  messages: ConversationMessage[];
+  token: string;
+  apiBaseUrl?: string;
+  onBackendChanged?: () => Promise<void>;
+  onDeviceChanged: () => Promise<void>;
+  onExit: () => void;
 }) {
   const claimDevice = useCallback(
     async (pairingCode?: string) => {
@@ -71,7 +152,7 @@ export function FigureFlow({
 
   return (
     <Stack.Navigator
-      initialRouteName="FigureHome"
+      initialRouteName={initialRouteName}
       screenOptions={{
         headerShadowVisible: false,
         headerTintColor: palette.ink,
@@ -80,8 +161,27 @@ export function FigureFlow({
         contentStyle: { backgroundColor: palette.canvas },
       }}
     >
-      <Stack.Screen name="FigureHome" options={{ title: '屿宙AI手办' }}>
-        {(props) => <FigureHomeScreen {...props} device={device} />}
+      <Stack.Screen name="FigureHome" options={{ headerShown: false }}>
+        {(props) => <FigureHomeScreen {...props} device={device} onExit={onExit} />}
+      </Stack.Screen>
+      <Stack.Screen name="DeviceHome" options={{ title: '我的设备' }}>
+        {(props) => (
+          <DeviceHomeScreen
+            {...props}
+            device={device}
+            apiBaseUrl={apiBaseUrl}
+            onBackendChanged={onBackendChanged}
+          />
+        )}
+      </Stack.Screen>
+      <Stack.Screen name="AlarmCenter" options={{ headerShown: false }}>
+        {() => <AlarmFlow token={token} device={device} />}
+      </Stack.Screen>
+      <Stack.Screen name="ConversationHistory" options={{ headerShown: false }}>
+        {(props) => <ConversationHistoryScreen {...props} device={device} messages={messages} />}
+      </Stack.Screen>
+      <Stack.Screen name="MoodDiary" options={{ title: '心情日记' }}>
+        {(props) => <MoodDiaryScreen {...props} />}
       </Stack.Screen>
       <Stack.Screen name="BasePreparation" component={BasePreparationScreen} options={{ title: '准备智能底座' }} />
       <Stack.Screen name="EnvironmentCheck" component={EnvironmentCheckScreen} options={{ title: '检查手机环境' }} />
@@ -111,23 +211,108 @@ export function FigureFlow({
 function FigureHomeScreen({
   navigation,
   device,
-}: NativeStackScreenProps<FigureStackParamList, 'FigureHome'> & { device: Device | null }) {
+  onExit,
+}: NativeStackScreenProps<FigureStackParamList, 'FigureHome'> & {
+  device: Device | null;
+  onExit: () => void;
+}) {
+  const isFocused = useIsFocused();
+  const characterName = device?.nfcTag?.matched && device.nfcTag.characterName
+    ? device.nfcTag.characterName
+    : device?.character?.name ?? 'Suki';
+  const characterTheme = getCharacterHomeTheme(
+    characterName,
+    device?.character?.accentColor,
+    device?.character?.backgroundImageUrl,
+  );
+  return (
+    <ImageBackground
+      key={characterName}
+      source={characterTheme.image}
+      style={styles.figureHome}
+      resizeMode="cover"
+    >
+      <StatusBar style={isFocused ? 'light' : 'dark'} />
+      <View style={[styles.figureHomeVeil, { backgroundColor: characterTheme.overlay }]} />
+      <SafeAreaView style={styles.figureHomeSafe}>
+        <View style={styles.figureHomeTop}>
+          <Pressable style={styles.roundBackButton} onPress={onExit}>
+            <Text style={styles.roundBackText}>‹</Text>
+          </Pressable>
+          <Text
+            adjustsFontSizeToFit
+            minimumFontScale={0.72}
+            numberOfLines={1}
+            style={styles.figureSignature}
+          >
+            {characterName} ♥ {characterTheme.slogan}
+          </Text>
+        </View>
+
+        <View style={styles.homeSideActions}>
+          <HomeIconButton icon="▰" label="历史对话" onPress={() => navigation.navigate('ConversationHistory')} />
+          <HomeIconButton icon="▣" label="我的设备" onPress={() => navigation.navigate(device ? 'Dashboard' : 'BasePreparation')} />
+        </View>
+
+        <View style={styles.homeBottomActions}>
+          <HomeEntryButton icon="▣" label="心情日记" onPress={() => navigation.navigate('MoodDiary')} />
+          <HomeEntryButton icon="◷" label="AI闹钟" onPress={() => navigation.navigate('AlarmCenter')} />
+        </View>
+      </SafeAreaView>
+    </ImageBackground>
+  );
+}
+
+function DeviceHomeScreen({
+  navigation,
+  device,
+  apiBaseUrl,
+  onBackendChanged,
+}: NativeStackScreenProps<FigureStackParamList, 'DeviceHome'> & {
+  device: Device | null;
+  apiBaseUrl: string;
+  onBackendChanged?: () => Promise<void>;
+}) {
+  const [backendAddress, setBackendAddress] = useState(apiBaseUrl.replace(/\/v1$/, ''));
+  const [savingBackend, setSavingBackend] = useState(false);
   const figureLabel = device?.nfcTag
     ? device.nfcTag.matched
-      ? `识别到 ${device.nfcTag.characterName}`
-      : `未绑定标签 ${device.nfcTag.uid}`
-    : device?.character?.name ?? '尚未放置角色';
-  return (
-    <ScrollView contentContainerStyle={styles.page}>
-      <View style={styles.brandBlock}>
-        <Text style={styles.kicker}>YU ZHOU · AI FIGURE</Text>
-        <Text style={styles.heroTitle}>让喜欢的角色，真正陪在身边</Text>
-        <Text style={styles.heroBody}>连接智能底座后，角色、声音、记忆与提醒会在设备间同步。</Text>
-      </View>
+      ? `当前角色：${device.nfcTag.characterName}`
+      : `未绑定标签：${device.nfcTag.uid}`
+    : device?.character?.name
+      ? `当前角色：${device.character.name}`
+      : '尚未放置角色';
 
+  useEffect(() => {
+    setBackendAddress(apiBaseUrl.replace(/\/v1$/, ''));
+  }, [apiBaseUrl]);
+
+  const saveBackend = async () => {
+    if (savingBackend) return;
+    try {
+      setSavingBackend(true);
+      const normalized = normalizeApiBaseUrl(backendAddress);
+      await saveApiBaseUrl(normalized);
+      setBackendAddress(normalized.replace(/\/v1$/, ''));
+      await onBackendChanged?.();
+      Alert.alert('保存成功', 'APP 已切换到新后端地址，下次配网也会同步给底座。');
+    } catch (saveError) {
+      Alert.alert(
+        '地址已保存或连接失败',
+        saveError instanceof Error ? saveError.message : '请确认后端服务已启动',
+      );
+    } finally {
+      setSavingBackend(false);
+    }
+  };
+
+  return (
+    <ScrollView contentContainerStyle={styles.page} keyboardShouldPersistTaps="handled">
       {device ? (
         <Pressable style={styles.deviceCard} onPress={() => navigation.navigate('Dashboard')}>
-          <View style={styles.figureAvatar}><Text style={styles.figureAvatarText}>屿</Text></View>
+          <View style={[styles.figureAvatar, { backgroundColor: device.character?.accentColor ?? palette.primary }]}>
+            <Text style={styles.figureAvatarText}>{device.character?.name?.slice(0, 1) ?? '屿'}</Text>
+          </View>
           <View style={styles.flex}>
             <View style={styles.rowBetween}>
               <Text style={styles.deviceName}>{device.name}</Text>
@@ -136,7 +321,7 @@ function FigureHomeScreen({
               </Text>
             </View>
             <Text style={styles.muted}>{figureLabel} · 音量 {device.volume}%</Text>
-            <Text style={styles.linkText}>进入底座主页  →</Text>
+            <Text style={styles.linkText}>进入设备管理  →</Text>
           </View>
         </Pressable>
       ) : (
@@ -148,8 +333,246 @@ function FigureHomeScreen({
       )}
 
       <PrimaryButton label="＋ 添加智能底座" onPress={() => navigation.navigate('BasePreparation')} />
-      {device ? <Text style={styles.demoHint}>现有设备不会受模拟连接流程影响</Text> : null}
+
+      <Text style={styles.sectionTitle}>连接设置</Text>
+      <View style={[styles.listCard, styles.deviceConnectionCard]}>
+        <Text style={styles.settingTitle}>后端服务地址</Text>
+        <Text style={styles.muted}>换网络时修改；下次配网会自动写入底座</Text>
+        <TextInput
+          style={styles.deviceAddressInput}
+          value={backendAddress}
+          onChangeText={setBackendAddress}
+          autoCapitalize="none"
+          autoCorrect={false}
+          keyboardType="url"
+          placeholder="http://电脑IP:3000"
+        />
+        <PrimaryButton
+          label={savingBackend ? '正在保存并检测…' : '保存并检测连接'}
+          disabled={savingBackend}
+          onPress={() => void saveBackend()}
+        />
+      </View>
     </ScrollView>
+  );
+}
+
+function getCharacterHomeTheme(
+  name: string,
+  accentColor?: string,
+  backgroundImageUrl?: string | null,
+) {
+  const themes: Record<string, { slogan: string; image: ImageSourcePropType; overlay: string }> = {
+    Suki: { slogan: '无暇孤独', image: sukiMorningImage, overlay: 'rgba(0, 0, 0, 0.13)' },
+    念念: { slogan: '温柔相伴', image: niannianHomeImage, overlay: 'rgba(49, 24, 79, 0.10)' },
+    苏软软: { slogan: '软软治愈', image: suRuanruanHomeImage, overlay: 'rgba(89, 48, 18, 0.08)' },
+  };
+  const theme = themes[name] ?? {
+    slogan: '一直陪着你',
+    image: sukiMorningImage,
+    overlay: hexToRgba(accentColor ?? '#000000', 0.2),
+  };
+  const cloudImageUrl = backgroundImageUrl?.trim();
+  return cloudImageUrl ? { ...theme, image: { uri: cloudImageUrl } } : theme;
+}
+
+function hexToRgba(hex: string, alpha: number) {
+  const match = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex);
+  if (!match) return `rgba(0, 0, 0, ${alpha})`;
+  return `rgba(${parseInt(match[1], 16)}, ${parseInt(match[2], 16)}, ${parseInt(match[3], 16)}, ${alpha})`;
+}
+
+function HomeIconButton({ icon, label, onPress }: { icon: string; label: string; onPress: () => void }) {
+  return (
+    <Pressable style={styles.homeIconButton} onPress={onPress}>
+      <Text style={styles.homeIcon}>{icon}</Text>
+      <Text style={styles.homeIconLabel}>{label}</Text>
+    </Pressable>
+  );
+}
+
+function HomeEntryButton({ icon, label, onPress }: { icon: string; label: string; onPress: () => void }) {
+  return (
+    <Pressable style={styles.homeEntryButton} onPress={onPress}>
+      <Text style={styles.homeEntryIcon}>{icon}</Text>
+      <Text style={styles.homeEntryLabel}>{label}</Text>
+    </Pressable>
+  );
+}
+
+function MoodDiaryScreen({ navigation }: NativeStackScreenProps<FigureStackParamList, 'MoodDiary'>) {
+  return (
+    <View style={styles.centerPage}>
+      <View style={styles.emptyOrb}><Text style={styles.emptyOrbText}>♡</Text></View>
+      <Text style={styles.centerTitle}>心情日记</Text>
+      <Text style={styles.centerMuted}>这个入口先放在首页里，后面我们再做日记记录和情绪陪伴。</Text>
+      <PrimaryButton label="返回 AI手办" onPress={() => navigation.goBack()} />
+    </View>
+  );
+}
+
+function ConversationHistoryScreen({
+  navigation,
+  device,
+  messages,
+}: NativeStackScreenProps<FigureStackParamList, 'ConversationHistory'> & {
+  device: Device | null;
+  messages: ConversationMessage[];
+}) {
+  const [hiddenIds, setHiddenIds] = useState<string[]>([]);
+  const [menuMessageId, setMenuMessageId] = useState<string | null>(null);
+  const [selecting, setSelecting] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+
+  useEffect(() => {
+    setHiddenIds((current) => current.filter((id) => messages.some((message) => message.id === id)));
+    setSelectedIds((current) => current.filter((id) => messages.some((message) => message.id === id)));
+  }, [messages]);
+
+  const visibleMessages = useMemo(
+    () => messages.filter((message) => !hiddenIds.includes(message.id)),
+    [hiddenIds, messages],
+  );
+  const selectedMessages = visibleMessages.filter((message) => selectedIds.includes(message.id));
+  const characterName = device?.character?.name ?? device?.nfcTag?.characterName ?? 'Suki';
+
+  const deleteMessages = (ids: string[]) => {
+    setHiddenIds((current) => Array.from(new Set([...current, ...ids])));
+    setSelectedIds((current) => current.filter((id) => !ids.includes(id)));
+    setMenuMessageId(null);
+    if (ids.length === selectedIds.length) setSelecting(false);
+  };
+
+  const enterSelecting = (messageId: string) => {
+    setSelecting(true);
+    setSelectedIds([messageId]);
+    setMenuMessageId(null);
+  };
+
+  const toggleSelected = (messageId: string) => {
+    setSelectedIds((current) =>
+      current.includes(messageId)
+        ? current.filter((id) => id !== messageId)
+        : [...current, messageId],
+    );
+  };
+
+  const copySelected = () => {
+    if (!selectedMessages.length) return;
+    Clipboard.setString(selectedMessages.map((message) => message.content).join('\n'));
+    Alert.alert('已复制', `已复制 ${selectedMessages.length} 条对话`);
+  };
+
+  return (
+    <SafeAreaView style={styles.historySafe}>
+      <View style={styles.historyHeader}>
+        <Pressable style={styles.historyBack} onPress={() => selecting ? (setSelecting(false), setSelectedIds([])) : navigation.goBack()}>
+          <Text style={styles.historyBackText}>‹</Text>
+        </Pressable>
+        <Text style={styles.historyTitle}>与{characterName}的对话记录</Text>
+        <View style={styles.historyBack} />
+      </View>
+      <ScrollView contentContainerStyle={[styles.historyContent, selecting && styles.historyContentSelecting]}>
+        {visibleMessages.length ? (
+          visibleMessages.map((message, index) => {
+            const previous = visibleMessages[index - 1];
+            const showTime = !previous || formatHistoryBucket(previous.createdAt) !== formatHistoryBucket(message.createdAt);
+            return (
+              <View key={message.id}>
+                {showTime ? <Text style={styles.historyTime}>{formatHistoryBucket(message.createdAt)}</Text> : null}
+                <ConversationBubble
+                  message={message}
+                  selecting={selecting}
+                  selected={selectedIds.includes(message.id)}
+                  menuVisible={menuMessageId === message.id}
+                  onToggle={() => toggleSelected(message.id)}
+                  onLongPress={() => setMenuMessageId(message.id)}
+                  onDelete={() => deleteMessages([message.id])}
+                  onSelect={() => enterSelecting(message.id)}
+                />
+              </View>
+            );
+          })
+        ) : (
+          <View style={styles.historyEmpty}>
+            <Text style={styles.centerTitle}>还没有对话记录</Text>
+            <Text style={styles.centerMuted}>和角色聊过天后，这里会按时间显示历史消息。</Text>
+          </View>
+        )}
+        <Text style={styles.historyHint}>长按对话气泡可进行更多操作</Text>
+      </ScrollView>
+      {selecting ? (
+        <View style={styles.historyBulkBar}>
+          <Pressable style={styles.historyBulkAction} disabled={!selectedMessages.length} onPress={copySelected}>
+            <Text style={styles.historyBulkIcon}>▣</Text>
+          </Pressable>
+          <Pressable
+            style={styles.historyBulkAction}
+            disabled={!selectedMessages.length}
+            onPress={() => Alert.alert('删除消息', `确定删除选中的 ${selectedMessages.length} 条消息吗？`, [
+              { text: '取消', style: 'cancel' },
+              { text: '删除', style: 'destructive', onPress: () => deleteMessages(selectedIds) },
+            ])}
+          >
+            <Text style={styles.historyBulkIcon}>⌫</Text>
+          </Pressable>
+        </View>
+      ) : null}
+    </SafeAreaView>
+  );
+}
+
+function ConversationBubble({
+  message,
+  selecting,
+  selected,
+  menuVisible,
+  onToggle,
+  onLongPress,
+  onDelete,
+  onSelect,
+}: {
+  message: ConversationMessage;
+  selecting: boolean;
+  selected: boolean;
+  menuVisible: boolean;
+  onToggle: () => void;
+  onLongPress: () => void;
+  onDelete: () => void;
+  onSelect: () => void;
+}) {
+  const mine = message.role === 'user';
+  return (
+    <View style={[styles.messageLine, mine && styles.messageLineMine]}>
+      {selecting ? (
+        <Pressable style={[styles.messageCheck, selected && styles.messageCheckSelected]} onPress={onToggle}>
+          <Text style={styles.messageCheckText}>{selected ? '✓' : ''}</Text>
+        </Pressable>
+      ) : null}
+      <View style={[styles.messageWrap, mine && styles.messageWrapMine]}>
+        {menuVisible && !selecting ? (
+          <View style={styles.messageMenu}>
+            <Pressable style={styles.messageMenuItem} onPress={onDelete}>
+              <Text style={styles.messageMenuIcon}>⌫</Text>
+              <Text style={styles.messageMenuText}>删除</Text>
+            </Pressable>
+            <Pressable style={styles.messageMenuItem} onPress={onSelect}>
+              <Text style={styles.messageMenuIcon}>☷</Text>
+              <Text style={styles.messageMenuText}>多选</Text>
+            </Pressable>
+            <View style={styles.messageMenuArrow} />
+          </View>
+        ) : null}
+        <Pressable
+          onPress={selecting ? onToggle : undefined}
+          onLongPress={onLongPress}
+          delayLongPress={350}
+          style={[styles.messageBubble, mine ? styles.messageBubbleMine : styles.messageBubbleAssistant]}
+        >
+          <Text style={[styles.messageText, mine && styles.messageTextMine]}>{message.content}</Text>
+        </Pressable>
+      </View>
+    </View>
   );
 }
 
@@ -738,8 +1161,80 @@ function Stat({ label, value }: { label: string; value: string }) {
   return <View style={styles.stat}><Text style={styles.statValue}>{value}</Text><Text style={styles.statLabel}>{label}</Text></View>;
 }
 
+function beijingParts(value: string | Date) {
+  const date = typeof value === 'string' ? new Date(value) : value;
+  const beijing = new Date(date.getTime() + 8 * 60 * 60 * 1000);
+  return {
+    year: beijing.getUTCFullYear(),
+    month: beijing.getUTCMonth() + 1,
+    day: beijing.getUTCDate(),
+    hour: beijing.getUTCHours(),
+    minute: beijing.getUTCMinutes(),
+  };
+}
+
+function beijingDayKey(value: string | Date) {
+  const parts = beijingParts(value);
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function formatHistoryBucket(value: string) {
+  const parts = beijingParts(value);
+  const now = new Date();
+  const todayKey = beijingDayKey(now);
+  const yesterdayKey = beijingDayKey(new Date(now.getTime() - 24 * 60 * 60 * 1000));
+  const key = beijingDayKey(value);
+  const day = key === todayKey ? '今天' : key === yesterdayKey ? '昨天' : `${parts.month}月${parts.day}日`;
+  return `${day} ${String(parts.hour).padStart(2, '0')}:${String(parts.minute).padStart(2, '0')}`;
+}
+
 const styles = StyleSheet.create({
   flex: { flex: 1 },
+  figureHome: { flex: 1, backgroundColor: '#111111' },
+  figureHomeVeil: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0, 0, 0, 0.13)' },
+  figureHomeSafe: { flex: 1, paddingHorizontal: 22, paddingTop: 10, paddingBottom: 18 },
+  figureHomeTop: { minHeight: 94, flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'center' },
+  roundBackButton: { position: 'absolute', left: 0, top: 5, width: 44, height: 44, borderRadius: 22, backgroundColor: 'rgba(36, 36, 36, 0.48)', alignItems: 'center', justifyContent: 'center' },
+  roundBackText: { color: '#FFFFFF', fontSize: 42, lineHeight: 43, fontWeight: '300', marginTop: -3 },
+  figureSignature: { color: '#FFFFFF', fontSize: 30, lineHeight: 42, fontWeight: '300', textAlign: 'center', textShadowColor: 'rgba(0, 0, 0, 0.28)', textShadowRadius: 10, textShadowOffset: { width: 0, height: 3 }, marginTop: 8, marginHorizontal: 54, flex: 1 },
+  homeSideActions: { position: 'absolute', right: 17, top: 156, gap: 22 },
+  homeIconButton: { alignItems: 'center', gap: 4 },
+  homeIcon: { width: 55, height: 55, borderRadius: 28, overflow: 'hidden', backgroundColor: 'rgba(62, 62, 62, 0.62)', color: '#FFFFFF', textAlign: 'center', lineHeight: 55, fontSize: 29, fontWeight: '900' },
+  homeIconLabel: { color: '#FFFFFF', fontSize: 14, fontWeight: '900', textShadowColor: 'rgba(0, 0, 0, 0.55)', textShadowRadius: 6, textShadowOffset: { width: 0, height: 2 } },
+  homeBottomActions: { position: 'absolute', left: 48, right: 48, bottom: 34, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end' },
+  homeEntryButton: { alignItems: 'center', minWidth: 98 },
+  homeEntryIcon: { color: '#FFFFFF', fontSize: 46, lineHeight: 54, fontWeight: '900', textShadowColor: 'rgba(0, 0, 0, 0.55)', textShadowRadius: 9, textShadowOffset: { width: 0, height: 3 } },
+  homeEntryLabel: { color: '#FFFFFF', fontSize: 21, fontWeight: '900', marginTop: 3, textShadowColor: 'rgba(0, 0, 0, 0.52)', textShadowRadius: 8, textShadowOffset: { width: 0, height: 2 } },
+  historySafe: { flex: 1, backgroundColor: '#FFFFFF' },
+  historyHeader: { height: 106, paddingTop: 22, backgroundColor: '#F0F0F0', flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16 },
+  historyBack: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },
+  historyBackText: { color: '#202020', fontSize: 43, lineHeight: 44, fontWeight: '300' },
+  historyTitle: { color: '#111111', fontSize: 22, fontWeight: '500' },
+  historyContent: { paddingHorizontal: 22, paddingTop: 20, paddingBottom: 42, minHeight: '100%' },
+  historyContentSelecting: { paddingBottom: 96 },
+  historyTime: { color: '#888888', fontSize: 15, textAlign: 'center', marginBottom: 24, marginTop: 8 },
+  historyHint: { color: '#D0D0D0', fontSize: 16, textAlign: 'center', marginTop: 38 },
+  historyEmpty: { minHeight: 360, alignItems: 'center', justifyContent: 'center', gap: 8 },
+  messageLine: { flexDirection: 'row', alignItems: 'center', marginBottom: 32 },
+  messageLineMine: { justifyContent: 'flex-end' },
+  messageCheck: { width: 30, height: 30, borderRadius: 15, borderWidth: 1.2, borderColor: '#7AC060', alignItems: 'center', justifyContent: 'center', marginRight: 11 },
+  messageCheckSelected: { backgroundColor: '#7AC060' },
+  messageCheckText: { color: '#FFFFFF', fontSize: 22, lineHeight: 25, fontWeight: '900' },
+  messageWrap: { maxWidth: '74%', position: 'relative', alignItems: 'flex-start' },
+  messageWrapMine: { alignItems: 'flex-end' },
+  messageBubble: { paddingHorizontal: 18, paddingVertical: 13, minHeight: 52 },
+  messageBubbleAssistant: { backgroundColor: '#EEEEEE', borderTopLeftRadius: 20, borderTopRightRadius: 20, borderBottomRightRadius: 20, borderBottomLeftRadius: 0 },
+  messageBubbleMine: { backgroundColor: '#000000', borderTopLeftRadius: 20, borderTopRightRadius: 20, borderBottomLeftRadius: 20, borderBottomRightRadius: 0 },
+  messageText: { color: '#202020', fontSize: 20, lineHeight: 28 },
+  messageTextMine: { color: '#FFFFFF' },
+  messageMenu: { position: 'absolute', left: 42, top: -78, width: 130, height: 56, borderRadius: 9, backgroundColor: '#666666', zIndex: 10, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-around' },
+  messageMenuItem: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 2 },
+  messageMenuIcon: { color: '#FFFFFF', fontSize: 18, lineHeight: 20 },
+  messageMenuText: { color: '#FFFFFF', fontSize: 14, fontWeight: '700' },
+  messageMenuArrow: { position: 'absolute', left: 55, bottom: -10, width: 0, height: 0, borderLeftWidth: 10, borderRightWidth: 10, borderTopWidth: 10, borderLeftColor: 'transparent', borderRightColor: 'transparent', borderTopColor: '#666666' },
+  historyBulkBar: { position: 'absolute', left: 0, right: 0, bottom: 0, height: 65, backgroundColor: '#F1F1F1', borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: '#DDDDDD', flexDirection: 'row', alignItems: 'center', justifyContent: 'space-around' },
+  historyBulkAction: { width: 88, height: 56, alignItems: 'center', justifyContent: 'center' },
+  historyBulkIcon: { color: '#686868', fontSize: 33, fontWeight: '700' },
   page: { padding: 20, paddingBottom: 42, gap: 16 },
   centerPage: { flex: 1, padding: 28, justifyContent: 'center', alignItems: 'center', gap: 14 },
   brandBlock: { backgroundColor: palette.ink, borderRadius: 28, padding: 24, marginBottom: 2 },
@@ -824,6 +1319,8 @@ const styles = StyleSheet.create({
   bluetoothText: { color: palette.primaryDark, fontSize: 24, fontWeight: '900' },
   chevron: { color: '#989198', fontSize: 32, fontWeight: '300' },
   listCard: { backgroundColor: palette.surface, borderRadius: 20, borderWidth: 1, borderColor: palette.border, overflow: 'hidden' },
+  deviceConnectionCard: { padding: 18, overflow: 'visible' },
+  deviceAddressInput: { marginTop: 14, marginBottom: 2, minHeight: 48, borderWidth: 1, borderColor: palette.border, borderRadius: 12, paddingHorizontal: 14, color: palette.ink, backgroundColor: '#FFFFFF', fontSize: 15 },
   networkRow: { minHeight: 62, paddingHorizontal: 16, flexDirection: 'row', alignItems: 'center', borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: palette.border, gap: 12 },
   networkIcon: { color: palette.ink, fontSize: 21 },
   networkName: { flex: 1, color: palette.ink, fontSize: 15, fontWeight: '700' },
