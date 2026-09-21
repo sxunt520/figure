@@ -9,7 +9,7 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { createHash, randomUUID } from 'crypto';
-import { In, IsNull, LessThanOrEqual, Repository } from 'typeorm';
+import { In, IsNull, LessThan, LessThanOrEqual, Repository } from 'typeorm';
 import {
   Alarm,
   AlarmSyncStatus,
@@ -43,6 +43,14 @@ import { TtsService } from './tts.service';
 import { AsrService } from './asr.service';
 import { AiChatService } from './ai-chat.service';
 import { AlarmSoundService } from './alarm-sound.service';
+import { SpeechChunker } from './speech-chunker';
+
+interface ConversationSpeechTurn {
+  id: string;
+  characterId: string;
+  source: string;
+  cancelled: boolean;
+}
 
 @Injectable()
 export class StoreService implements OnModuleInit, OnModuleDestroy {
@@ -60,6 +68,10 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
   private readonly reminderRetryAfter = new Map<string, number>();
   private readonly alarmRetryAfter = new Map<string, number>();
   private readonly conversationChains = new Map<string, Promise<void>>();
+  private readonly conversationSpeechTurns = new Map<
+    string,
+    ConversationSpeechTurn
+  >();
 
   constructor(
     @InjectRepository(UserEntity)
@@ -257,6 +269,9 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       this.requireOwnedDevice(userId, deviceId),
       this.requireCharacter(characterId),
     ]);
+    if (device.characterId !== character.id) {
+      await this.cancelPendingConversationSpeech(device.id, 'character_switched');
+    }
     device.characterId = character.id;
     await this.deviceRepository.save(device);
     await this.enqueueCommand(device.id, 'sync_character', {
@@ -420,19 +435,417 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
   async listConversationMessages(
     userId: string,
     deviceId: string,
+    before?: string,
+    requestedLimit = 30,
   ): Promise<ConversationMessage[]> {
     const device = await this.requireOwnedDevice(userId, deviceId);
     if (!device.characterId) return [];
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(50, Math.trunc(requestedLimit)))
+      : 30;
+    const beforeDate = before ? new Date(before) : null;
+    if (beforeDate && Number.isNaN(beforeDate.getTime())) {
+      throw new BadRequestException('历史消息游标无效');
+    }
     const messages = await this.conversationRepository.find({
       where: {
         userId,
         deviceId,
         characterId: device.characterId,
+        ...(beforeDate ? { createdAt: LessThan(beforeDate) } : {}),
       },
+      order: { createdAt: 'DESC' },
+      take: limit,
+    });
+    return messages.reverse().map((message) => this.toConversationMessage(message));
+  }
+
+  async streamAppConversationMessage(
+    userId: string,
+    deviceId: string,
+    text: string,
+    clientRequestId: string | undefined,
+    emit: (event: Record<string, unknown>) => void,
+    signal?: AbortSignal,
+  ) {
+    const device = await this.requireOwnedDevice(userId, deviceId);
+    if (!device.characterId) {
+      throw new BadRequestException('设备尚未绑定角色');
+    }
+    const character = await this.requireCharacter(device.characterId);
+    const normalizedText = text.trim();
+    if (!normalizedText) throw new BadRequestException('消息不能为空');
+    const normalizedRequestId = clientRequestId?.trim();
+    if (normalizedRequestId && !/^[A-Za-z0-9_-]{8,20}$/.test(normalizedRequestId)) {
+      throw new BadRequestException('客户端请求编号格式无效');
+    }
+    const source = normalizedRequestId
+      ? `app:${normalizedRequestId}`
+      : 'app_text_stream';
+
+    const existingMessages = normalizedRequestId
+      ? await this.conversationRepository.find({
+          where: {
+            userId,
+            deviceId,
+            characterId: character.id,
+            source,
+          },
+          order: { createdAt: 'ASC' },
+        })
+      : [];
+    let userMessage = existingMessages.find((message) => message.role === 'user');
+    const completedMessage = existingMessages.find(
+      (message) => message.role === 'assistant',
+    );
+    if (userMessage) {
+      emit({ type: 'message.created', message: this.toConversationMessage(userMessage) });
+    }
+    if (completedMessage) {
+      emit({
+        type: 'message.completed',
+        message: this.toConversationMessage(completedMessage),
+        provider: 'cached',
+        requestId: normalizedRequestId ?? null,
+      });
+      return;
+    }
+
+    if (!userMessage) {
+      userMessage = await this.conversationRepository.save(
+        this.conversationRepository.create({
+          userId,
+          deviceId,
+          characterId: character.id,
+          role: 'user',
+          content: normalizedText,
+          source,
+        }),
+      );
+      emit({ type: 'message.created', message: this.toConversationMessage(userMessage) });
+    }
+    this.logger.debug(
+      `App conversation stream accepted device=${deviceId} character=${character.id} request=${normalizedRequestId ?? 'none'}`,
+    );
+
+    const recentMessages = await this.conversationRepository.find({
+      where: { userId, deviceId, characterId: character.id },
       order: { createdAt: 'DESC' },
       take: 30,
     });
-    return messages.reverse().map((message) => this.toConversationMessage(message));
+    recentMessages.reverse();
+    const prompt =
+      character.prompt?.trim() ||
+      `你是${character.name}。${character.description}请始终以这个角色的身份，用自然、简短的中文回答。`;
+    this.logger.debug(
+      `App conversation history ready device=${deviceId} messages=${recentMessages.length} request=${normalizedRequestId ?? 'none'}`,
+    );
+
+    const speechTurn = await this.beginAppConversationSpeech(
+      device,
+      character,
+      source,
+      userMessage.id,
+    );
+    const speechChunker = speechTurn ? new SpeechChunker() : null;
+    let speechSequence = 0;
+    let assistantMessageId: string | null = null;
+    let responseModel = process.env.AI_MODEL?.trim() || 'MiniMax-M2.7';
+    let speechChain = Promise.resolve();
+    const queueSpeechChunks = (chunks: string[]) => {
+      if (!speechTurn) return;
+      for (const chunk of chunks) {
+        const spokenText = this.tts.normalizeForSpeech(chunk);
+        if (!spokenText) continue;
+        const sequence = speechSequence;
+        speechSequence += 1;
+        speechChain = speechChain.then(() =>
+          this.prepareAppConversationSpeechChunk(
+            device,
+            character,
+            speechTurn,
+            spokenText,
+            sequence,
+            assistantMessageId,
+            userMessage.id,
+            responseModel,
+          ),
+        );
+      }
+    };
+
+    let reply: Awaited<ReturnType<AiChatService['stream']>>;
+    try {
+      reply = await this.aiChat.stream(
+        prompt,
+        recentMessages.map((message) => ({
+          role: message.role,
+          content: message.content,
+        })),
+        (delta) => {
+          emit({ type: 'message.delta', delta });
+          if (speechChunker) queueSpeechChunks(speechChunker.push(delta));
+        },
+        signal,
+      );
+    } catch (error) {
+      if (speechTurn) {
+        await this.cancelPendingConversationSpeech(
+          device.id,
+          signal?.aborted ? 'stream_cancelled' : 'stream_failed',
+        );
+      }
+      throw error;
+    }
+    responseModel = reply.model;
+    if (speechChunker) queueSpeechChunks(speechChunker.flush());
+    const assistantMessage = await this.conversationRepository.save(
+      this.conversationRepository.create({
+        userId,
+        deviceId,
+        characterId: character.id,
+        role: 'assistant',
+        content: reply.content,
+        source,
+      }),
+    );
+    assistantMessageId = assistantMessage.id;
+    emit({
+      type: 'message.completed',
+      message: this.toConversationMessage(assistantMessage),
+      provider: reply.model,
+      requestId: reply.requestId,
+    });
+    if (speechTurn) {
+      void speechChain
+        .then(() =>
+          this.finishAppConversationSpeech(
+            device.id,
+            speechTurn,
+            assistantMessage.id,
+            speechSequence,
+          ),
+        )
+        .catch((error) =>
+          this.failAppConversationSpeech(
+            device.id,
+            speechTurn,
+            assistantMessage.id,
+            error,
+          ),
+        );
+    }
+  }
+
+  private async beginAppConversationSpeech(
+    device: DeviceEntity,
+    character: CharacterEntity,
+    source: string,
+    userMessageId: string,
+  ) {
+    if (!this.isDeviceOnline(device)) {
+      await this.eventRepository.save(
+        this.eventRepository.create({
+          deviceId: device.id,
+          type: 'conversation_speech_skipped',
+          payload: {
+            source,
+            userMessageId,
+            characterId: character.id,
+            reason: 'device_offline',
+          },
+        }),
+      );
+      this.logger.log(
+        `Skipping app conversation speech for offline device=${device.id} message=${userMessageId}`,
+      );
+      return null;
+    }
+
+    await this.cancelPendingConversationSpeech(device.id, 'superseded');
+    const turn: ConversationSpeechTurn = {
+      id: randomUUID(),
+      characterId: character.id,
+      source,
+      cancelled: false,
+    };
+    this.conversationSpeechTurns.set(device.id, turn);
+    await this.eventRepository.save(
+      this.eventRepository.create({
+        deviceId: device.id,
+        type: 'conversation_speech_started',
+        payload: {
+          source,
+          conversationTurnId: turn.id,
+          userMessageId,
+          characterId: character.id,
+        },
+      }),
+    );
+    return turn;
+  }
+
+  private async prepareAppConversationSpeechChunk(
+    device: DeviceEntity,
+    character: CharacterEntity,
+    turn: ConversationSpeechTurn,
+    text: string,
+    sequence: number,
+    assistantMessageId: string | null,
+    userMessageId: string,
+    aiModel: string,
+  ) {
+    if (!this.isConversationSpeechTurnActive(device.id, turn)) return;
+    try {
+      const speech = await this.tts.synthesize(
+        text,
+        character.voiceId,
+        character.ttsModel,
+      );
+      if (!this.isConversationSpeechTurnActive(device.id, turn)) return;
+      const currentDevice = await this.deviceRepository.findOne({
+        where: { id: device.id },
+      });
+      if (
+        currentDevice?.ownerUserId !== device.ownerUserId ||
+        currentDevice.characterId !== character.id ||
+        !this.isDeviceOnline(currentDevice) ||
+        !this.isConversationSpeechTurnActive(device.id, turn)
+      ) {
+        this.logger.log(
+          `Skipping stale app conversation speech chunk device=${device.id} turn=${turn.id} sequence=${sequence}`,
+        );
+        return;
+      }
+
+      const command = await this.enqueueCommand(device.id, 'speak_text', {
+        text,
+        characterId: character.id,
+        voiceId: speech.voice,
+        audioPath: speech.audioPath,
+        audioFormat: speech.format,
+        sampleRate: speech.sampleRate,
+        provider: speech.provider,
+        ttsModel: speech.model,
+        aiModel,
+        conversationMessageId: assistantMessageId,
+        userMessageId,
+        conversationTurnId: turn.id,
+        sequence,
+        source: 'app_conversation_stream_chunk',
+      });
+      if (!this.isConversationSpeechTurnActive(device.id, turn)) {
+        command.acknowledgedAt = new Date();
+        await this.commandRepository.save(command);
+        return;
+      }
+      await this.eventRepository.save(
+        this.eventRepository.create({
+          deviceId: device.id,
+          type: 'conversation_speech_chunk_ready',
+          payload: {
+            source: turn.source,
+            conversationTurnId: turn.id,
+            sequence,
+            text,
+            assistantMessageId,
+            userMessageId,
+            commandId: command.id,
+            characterId: character.id,
+            audioPath: speech.audioPath,
+            voiceId: speech.voice,
+            ttsModel: speech.model,
+          },
+        }),
+      );
+      this.logger.log(
+        `App conversation speech chunk queued device=${device.id} turn=${turn.id} sequence=${sequence}`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'unknown error';
+      this.logger.warn(
+        `Unable to prepare app conversation speech chunk device=${device.id} turn=${turn.id} sequence=${sequence}: ${message}`,
+      );
+      await this.eventRepository
+        .save(
+          this.eventRepository.create({
+            deviceId: device.id,
+            type: 'conversation_speech_chunk_failed',
+            payload: {
+              source: turn.source,
+              conversationTurnId: turn.id,
+              sequence,
+              assistantMessageId,
+              userMessageId,
+              characterId: character.id,
+              message,
+            },
+          }),
+        )
+        .catch(() => undefined);
+    }
+  }
+
+  private isConversationSpeechTurnActive(
+    deviceId: string,
+    turn: ConversationSpeechTurn,
+  ) {
+    return (
+      !turn.cancelled && this.conversationSpeechTurns.get(deviceId) === turn
+    );
+  }
+
+  private async finishAppConversationSpeech(
+    deviceId: string,
+    turn: ConversationSpeechTurn,
+    assistantMessageId: string,
+    chunkCount: number,
+  ) {
+    if (!this.isConversationSpeechTurnActive(deviceId, turn)) return;
+    this.conversationSpeechTurns.delete(deviceId);
+    await this.eventRepository.save(
+      this.eventRepository.create({
+        deviceId,
+        type: 'conversation_speech_queued',
+        payload: {
+          source: turn.source,
+          conversationTurnId: turn.id,
+          assistantMessageId,
+          characterId: turn.characterId,
+          chunkCount,
+        },
+      }),
+    );
+  }
+
+  private async failAppConversationSpeech(
+    deviceId: string,
+    turn: ConversationSpeechTurn,
+    assistantMessageId: string,
+    error: unknown,
+  ) {
+    if (this.conversationSpeechTurns.get(deviceId) === turn) {
+      this.conversationSpeechTurns.delete(deviceId);
+    }
+    const message = error instanceof Error ? error.message : 'unknown error';
+    this.logger.warn(
+      `Conversation speech pipeline failed device=${deviceId} turn=${turn.id}: ${message}`,
+    );
+    await this.eventRepository
+      .save(
+        this.eventRepository.create({
+          deviceId,
+          type: 'conversation_speech_failed',
+          payload: {
+            source: turn.source,
+            conversationTurnId: turn.id,
+            assistantMessageId,
+            characterId: turn.characterId,
+            message,
+          },
+        }),
+      )
+      .catch(() => undefined);
   }
 
   listReminders(userId: string, deviceId?: string) {
@@ -748,6 +1161,50 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     await this.commandRepository.save(matching);
   }
 
+  private async cancelPendingConversationSpeech(
+    deviceId: string,
+    reason: string,
+  ) {
+    const activeTurn = this.conversationSpeechTurns.get(deviceId);
+    if (activeTurn) {
+      activeTurn.cancelled = true;
+      this.conversationSpeechTurns.delete(deviceId);
+    }
+
+    const commands = await this.commandRepository.find({
+      where: {
+        deviceId,
+        type: 'speak_text',
+        acknowledgedAt: IsNull(),
+      },
+      order: { createdAt: 'ASC' },
+    });
+    const matching = commands.filter((command) => {
+      const source =
+        typeof command.payload.source === 'string' ? command.payload.source : '';
+      return (
+        source === 'app_conversation_stream' ||
+        source === 'app_conversation_stream_chunk' ||
+        source === 'ai_conversation'
+      );
+    });
+    if (matching.length) {
+      const cancelledAt = new Date();
+      for (const command of matching) command.acknowledgedAt = cancelledAt;
+      await this.commandRepository.save(matching);
+    }
+    if (activeTurn || matching.length) {
+      this.logger.log(
+        `Conversation speech cancelled device=${deviceId} reason=${reason} pending=${matching.length}`,
+      );
+    }
+    return {
+      speechCancellationReason: reason,
+      cancelledConversationTurnId: activeTurn?.id ?? null,
+      cancelledSpeechCommandCount: matching.length,
+    };
+  }
+
   async receiveDeviceEvent(
     device: DeviceEntity,
     type: string,
@@ -769,6 +1226,10 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       if (matchedCharacter && device.ownerUserId) {
         switched = device.characterId !== matchedCharacter.id;
         if (switched) {
+          const cancellation = await this.cancelPendingConversationSpeech(
+            device.id,
+            'nfc_character_switched',
+          );
           device.characterId = matchedCharacter.id;
           // Keep only the newest physical selection when the device was offline.
           await this.commandRepository.delete({
@@ -781,12 +1242,14 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
             source: 'nfc',
             nfcTagUid: uid,
           });
+          eventPayload = { ...eventPayload, ...cancellation };
         }
       }
       device.lastNfcTagUid = uid;
       device.lastNfcAt = new Date();
       device.lastNfcMatchedCharacterId = matchedCharacter?.id ?? null;
       eventPayload = {
+        ...eventPayload,
         ...payload,
         uid,
         matched: Boolean(matchedCharacter),
@@ -809,6 +1272,17 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
         ...payload,
         uid,
         present: false,
+      };
+    } else if (
+      type === 'button_pressed' &&
+      payload.commandType === 'stop_playback'
+    ) {
+      eventPayload = {
+        ...payload,
+        ...(await this.cancelPendingConversationSpeech(
+          device.id,
+          'function_button',
+        )),
       };
     } else if (
       type === 'button_pressed' &&
@@ -1596,12 +2070,7 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
   }
 
   private toDeviceView(device: DeviceEntity, characters: CharacterEntity[]): DeviceView {
-    const onlineWindowSeconds = Number(
-      process.env.DEVICE_ONLINE_WINDOW_SECONDS ?? 45,
-    );
-    const isOnline =
-      device.lastSeenAt !== null &&
-      Date.now() - device.lastSeenAt.getTime() < onlineWindowSeconds * 1000;
+    const isOnline = this.isDeviceOnline(device);
     const character = characters.find((item) => item.id === device.characterId) ?? null;
     const nfcCharacter =
       device.lastNfcMatchedCharacterId === null
@@ -1628,6 +2097,16 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       lastSeenAt: device.lastSeenAt?.toISOString() ?? null,
       volume: device.volume,
     };
+  }
+
+  private isDeviceOnline(device: DeviceEntity) {
+    const onlineWindowSeconds = Number(
+      process.env.DEVICE_ONLINE_WINDOW_SECONDS ?? 45,
+    );
+    return (
+      device.lastSeenAt !== null &&
+      Date.now() - device.lastSeenAt.getTime() < onlineWindowSeconds * 1000
+    );
   }
 
   private async seedDevelopmentData() {

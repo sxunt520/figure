@@ -3,6 +3,7 @@ import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { raw } from 'express';
 import { AppModule } from './app.module';
+import { registerConversationWebSocket } from './modules/figure-companion/conversation-websocket';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
@@ -19,6 +20,7 @@ async function bootstrap() {
       transform: true,
     }),
   );
+  registerConversationWebSocket(app);
 
   const port = Number(process.env.PORT ?? 3000);
   await app.listen(port, '0.0.0.0');

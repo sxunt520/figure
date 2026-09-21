@@ -311,6 +311,11 @@ export class DeviceMessageDto {
   @IsNotEmpty()
   @MaxLength(2000)
   text: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(20)
+  clientRequestId?: string;
 }
 
 export class SpeakTextDto {
