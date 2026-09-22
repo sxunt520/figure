@@ -6,12 +6,16 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   Req,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import { Response } from 'express';
 import { UserAuthGuard, UserRequest } from './auth.guards';
 import {
   BindDeviceDto,
+  DeviceMessageDto,
   SpeakTextDto,
   UpdateCharacterDto,
   UpdateDeviceNameDto,
@@ -134,7 +138,64 @@ export class DevicesController {
   listMessages(
     @Req() request: UserRequest,
     @Param('deviceId') deviceId: string,
+    @Query('before') before?: string,
+    @Query('limit') limit?: string,
   ) {
-    return this.store.listConversationMessages(request.user.id, deviceId);
+    return this.store.listConversationMessages(
+      request.user.id,
+      deviceId,
+      before,
+      limit ? Number(limit) : undefined,
+    );
+  }
+
+  @Post(':deviceId/messages/stream')
+  async streamMessage(
+    @Req() request: UserRequest,
+    @Param('deviceId') deviceId: string,
+    @Body() dto: DeviceMessageDto,
+    @Res() response: Response,
+  ) {
+    response.status(200);
+    response.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+    response.setHeader('Cache-Control', 'no-cache, no-transform');
+    response.setHeader('Connection', 'keep-alive');
+    response.setHeader('X-Accel-Buffering', 'no');
+
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    // React Native's XMLHttpRequest can emit an early response `close` while
+    // it is still waiting for streamed chunks. Treating that as cancellation
+    // aborts the upstream AI request and leaves the app waiting forever.
+    // `aborted` and response write errors represent actual broken requests.
+    request.once('aborted', abort);
+    response.once('error', abort);
+    const emit = (event: Record<string, unknown>) => {
+      if (!response.destroyed && !response.writableEnded) {
+        response.write(`${JSON.stringify(event)}\n`);
+      }
+    };
+
+    try {
+      await this.store.streamAppConversationMessage(
+        request.user.id,
+        deviceId,
+        dto.text,
+        dto.clientRequestId,
+        emit,
+        controller.signal,
+      );
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        emit({
+          type: 'error',
+          message: error instanceof Error ? error.message : '流式对话失败',
+        });
+      }
+    } finally {
+      request.off('aborted', abort);
+      response.off('error', abort);
+      if (!response.destroyed && !response.writableEnded) response.end();
+    }
   }
 }

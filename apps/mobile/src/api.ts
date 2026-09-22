@@ -60,6 +60,35 @@ export function normalizeApiBaseUrl(value?: string) {
 
 export let API_BASE_URL = normalizeApiBaseUrl(DEFAULT_API_BASE_URL);
 
+export type ConversationStreamEvent =
+  | { type: 'message.created'; message: ConversationMessage }
+  | { type: 'message.delta'; delta: string }
+  | {
+      type: 'message.completed';
+      message: ConversationMessage;
+      provider: string;
+      requestId: string | null;
+    }
+  | { type: 'error'; message: string };
+
+export type DeviceVoiceEvent =
+  | { type: 'voice.listening'; deviceId: string }
+  | {
+      type: 'voice.transcript.partial' | 'voice.transcript.sentence';
+      deviceId: string;
+      text: string;
+      elapsedMs: number;
+    }
+  | {
+      type: 'voice.transcript.final';
+      deviceId: string;
+      text: string;
+      durationMs: number;
+      firstPartialMs: number | null;
+      asrMode: 'realtime' | 'batch_fallback';
+    }
+  | { type: 'voice.error'; deviceId?: string; message: string };
+
 export function getApiBaseUrl() {
   return API_BASE_URL;
 }
@@ -116,6 +145,293 @@ async function request<T>(
     throw new Error(message || `请求失败（${response.status}）`);
   }
   return payload as T;
+}
+
+function createConversationAbortError() {
+  const error = new Error('流式对话已取消');
+  error.name = 'AbortError';
+  return error;
+}
+
+function conversationWebSocketUrl() {
+  const url = new URL(API_BASE_URL);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.pathname = '/v1/devices/messages/stream';
+  url.search = '';
+  url.hash = '';
+  return url.toString();
+}
+
+function voiceEventsWebSocketUrl() {
+  const url = new URL(API_BASE_URL);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.pathname = '/v1/devices/voice/events';
+  url.search = '';
+  url.hash = '';
+  return url.toString();
+}
+
+export function subscribeDeviceVoiceRecognition(
+  token: string,
+  deviceId: string,
+  onEvent: (event: DeviceVoiceEvent) => void,
+) {
+  let stopped = false;
+  let socket: WebSocket | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const connect = () => {
+    if (stopped) return;
+    socket = new WebSocket(voiceEventsWebSocketUrl());
+    socket.onopen = () => {
+      socket?.send(
+        JSON.stringify({ type: 'voice.subscribe', token, deviceId }),
+      );
+    };
+    socket.onmessage = (message) => {
+      try {
+        const event = JSON.parse(String(message.data)) as
+          | DeviceVoiceEvent
+          | { type: 'voice.subscribed'; deviceId: string };
+        if (event.type !== 'voice.subscribed') onEvent(event);
+      } catch {
+        onEvent({ type: 'voice.error', message: '实时识别状态无法解析' });
+      }
+    };
+    socket.onclose = () => {
+      socket = null;
+      if (!stopped) reconnectTimer = setTimeout(connect, 2000);
+    };
+    socket.onerror = () => {
+      // onclose performs a quiet reconnect; normal history loading still works.
+    };
+  };
+
+  connect();
+  return () => {
+    stopped = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    socket?.close();
+    socket = null;
+  };
+}
+
+function streamConversationMessageOverWebSocket(
+  token: string,
+  deviceId: string,
+  text: string,
+  onEvent: (event: ConversationStreamEvent) => void,
+  options?: {
+    clientRequestId?: string;
+    signal?: AbortSignal;
+  },
+) {
+  return new Promise<void>((resolve, reject) => {
+    const socket = new WebSocket(conversationWebSocketUrl());
+    let opened = false;
+    let completed = false;
+    let settled = false;
+    const settle = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      options?.signal?.removeEventListener('abort', abortRequest);
+      try {
+        if (
+          socket.readyState === WebSocket.CONNECTING ||
+          socket.readyState === WebSocket.OPEN
+        ) {
+          socket.close();
+        }
+      } catch {
+        // The promise still settles even when an older Android WebSocket
+        // implementation cannot close during the connecting state.
+      }
+      if (error) reject(error);
+      else resolve();
+    };
+    const abortRequest = () => settle(createConversationAbortError());
+
+    socket.onopen = () => {
+      if (settled) {
+        socket.close();
+        return;
+      }
+      opened = true;
+      socket.send(
+        JSON.stringify({
+          type: 'message.create',
+          token,
+          deviceId,
+          text,
+          clientRequestId: options?.clientRequestId,
+        }),
+      );
+    };
+    socket.onmessage = (message) => {
+      try {
+        const event = JSON.parse(String(message.data)) as ConversationStreamEvent;
+        onEvent(event);
+        if (event.type === 'error') {
+          settle(new Error(event.message));
+        } else if (event.type === 'message.completed') {
+          completed = true;
+          settle();
+        }
+      } catch {
+        settle(new Error('后端返回了无法解析的流式数据'));
+      }
+    };
+    socket.onerror = () => {
+      const error = new Error(
+        opened
+          ? 'WebSocket 流式连接异常'
+          : 'WebSocket 流式连接不可用',
+      );
+      error.name = opened ? 'ConversationStreamError' : 'WebSocketUnavailable';
+      settle(error);
+    };
+    socket.onclose = () => {
+      if (completed || settled) return;
+      const error = new Error('WebSocket 流式连接已断开');
+      error.name = opened ? 'ConversationStreamError' : 'WebSocketUnavailable';
+      settle(error);
+    };
+
+    options?.signal?.addEventListener('abort', abortRequest, { once: true });
+    if (options?.signal?.aborted) abortRequest();
+  });
+}
+
+function streamConversationMessageOverHttp(
+  token: string,
+  deviceId: string,
+  text: string,
+  onEvent: (event: ConversationStreamEvent) => void,
+  options?: {
+    clientRequestId?: string;
+    signal?: AbortSignal;
+  },
+) {
+  return new Promise<void>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    let consumedLength = 0;
+    let pending = '';
+    let serverError = '';
+    let settled = false;
+    const abortRequest = () => {
+      xhr.abort();
+      settle(createConversationAbortError());
+    };
+
+    const settle = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      options?.signal?.removeEventListener('abort', abortRequest);
+      if (error) reject(error);
+      else resolve();
+    };
+    const consume = (final = false) => {
+      const responseText = xhr.responseText ?? '';
+      pending += responseText.slice(consumedLength);
+      consumedLength = responseText.length;
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop() ?? '';
+      if (final && pending.trim()) {
+        lines.push(pending);
+        pending = '';
+      }
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line) as ConversationStreamEvent;
+          if (event.type === 'error') serverError = event.message;
+          onEvent(event);
+        } catch {
+          serverError = '后端返回了无法解析的流式数据';
+        }
+      }
+    };
+
+    xhr.open(
+      'POST',
+      `${API_BASE_URL}/devices/${encodeURIComponent(deviceId)}/messages/stream`,
+    );
+    xhr.setRequestHeader('authorization', `Bearer ${token}`);
+    xhr.setRequestHeader('content-type', 'application/json');
+    xhr.setRequestHeader('accept', 'application/x-ndjson');
+    xhr.onprogress = () => consume();
+    xhr.onload = () => {
+      consume(true);
+      if (xhr.status < 200 || xhr.status >= 300) {
+        settle(new Error(serverError || `请求失败（${xhr.status}）`));
+      } else if (serverError) {
+        settle(new Error(serverError));
+      } else {
+        settle();
+      }
+    };
+    xhr.onerror = () =>
+      settle(
+        options?.signal?.aborted
+          ? createConversationAbortError()
+          : new Error(`无法连接后端 ${API_BASE_URL}：网络不可达`),
+      );
+    xhr.onabort = () => settle(createConversationAbortError());
+    xhr.ontimeout = () => settle(new Error('流式对话超时，请稍后重试'));
+    xhr.timeout = 70_000;
+    options?.signal?.addEventListener('abort', abortRequest, { once: true });
+    if (options?.signal?.aborted) {
+      abortRequest();
+      return;
+    }
+    xhr.send(
+      JSON.stringify({
+        text,
+        clientRequestId: options?.clientRequestId,
+      }),
+    );
+  });
+}
+
+async function streamConversationMessage(
+  token: string,
+  deviceId: string,
+  text: string,
+  onEvent: (event: ConversationStreamEvent) => void,
+  options?: {
+    clientRequestId?: string;
+    signal?: AbortSignal;
+  },
+) {
+  try {
+    await streamConversationMessageOverWebSocket(
+      token,
+      deviceId,
+      text,
+      onEvent,
+      options,
+    );
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.name === 'WebSocketUnavailable' &&
+      !options?.signal?.aborted
+    ) {
+      await streamConversationMessageOverHttp(
+        token,
+        deviceId,
+        text,
+        onEvent,
+        options,
+      );
+      return;
+    }
+    throw error;
+  }
+}
+
+export function isConversationStreamCancelled(error: unknown) {
+  return error instanceof Error && error.name === 'AbortError';
 }
 
 export const api = {
@@ -219,8 +535,23 @@ export const api = {
       token,
     ),
 
-  listConversationMessages: (token: string, deviceId: string) =>
-    request<ConversationMessage[]>(`/devices/${deviceId}/messages`, {}, token),
+  listConversationMessages: (
+    token: string,
+    deviceId: string,
+    before?: string,
+    limit = 30,
+  ) => {
+    const query = new URLSearchParams();
+    if (before) query.set('before', before);
+    query.set('limit', String(limit));
+    return request<ConversationMessage[]>(
+      `/devices/${deviceId}/messages?${query.toString()}`,
+      {},
+      token,
+    );
+  },
+
+  streamConversationMessage,
 
   listReminders: (token: string, deviceId?: string) =>
     request<Reminder[]>(

@@ -58,9 +58,10 @@ DASHSCOPE_TTS_MODEL=cosyvoice-v3-flash
 DASHSCOPE_TTS_DEFAULT_VOICE=longanyang
 ```
 
-短语音识别使用 `ALIYUN_ACCESS_KEY_ID`、`ALIYUN_ACCESS_KEY_SECRET` 和
-`ALIYUN_NLS_APP_KEY`。后端自动获取并缓存 NLS Token，AccessKey 不会下发到
-APP 或 ESP32。密钥只配置在根目录 `.env`。
+语音识别使用 `ALIYUN_ACCESS_KEY_ID`、`ALIYUN_ACCESS_KEY_SECRET` 和
+`ALIYUN_NLS_APP_KEY`。设备录音默认经 WebSocket PCM 流进入阿里云实时识别，
+实时连接不可用时自动退回完整 WAV/PCM 批量识别。后端自动获取并缓存 NLS
+Token，AccessKey 不会下发到 APP 或 ESP32。密钥只配置在根目录 `.env`。
 
 角色对话使用 MiniMax 的 OpenAI 兼容接口：
 
@@ -160,7 +161,7 @@ npx expo export --platform ios --output-dir /tmp/figure-expo-export
 2. 将 `figure_users` 演示用户映射替换为现有 APP 用户表和正式登录 Token。
 3. 实体按键到货后，将常开按键接在 `GPIO39` 与 `GND` 之间；固件接口已经就绪。
 4. 将临时门禁卡替换为手办内置 NTAG213；现有 RC522 UID 识别、角色绑定和自动切换链路可直接复用。
-5. 连续对话阶段再升级为 WebSocket + Opus；当前 VAD + HTTP 半双工链路继续作为稳定降级方案。
+5. 当前设备语音已使用 WebSocket + PCM16 实时识别；识别完成后，同一连接会直接推送分段文本与 TTS 音频，底座收到首段即可播放，并支持再次按下对话键打断当前回复。HTTP WAV、设备指令轮询仍作为稳定降级链路；后续可继续升级为 Opus 编码和真正的全双工语音。
 
 ## ESP32-S3 主板自检
 

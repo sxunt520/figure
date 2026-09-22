@@ -156,7 +156,10 @@ export class TtsService {
       throw new ServiceUnavailableException('DASHSCOPE_TTS_SAMPLE_RATE 配置无效');
     }
 
-    const spokenText = this.toSpokenText(text);
+    const spokenText = this.normalizeForSpeech(text);
+    if (!spokenText) {
+      throw new ServiceUnavailableException('文本中没有需要朗读的内容');
+    }
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60_000);
@@ -238,7 +241,7 @@ export class TtsService {
     };
   }
 
-  private toSpokenText(text: string) {
+  normalizeForSpeech(text: string) {
     const stripped = text
       .replace(/[（(【\[]([^（）()【】\[\]]{1,24})[）)】\]]/g, (matched, inner) => {
         const cue = String(inner).trim();
@@ -251,7 +254,7 @@ export class TtsService {
       .replace(/\s*([，。！？、,.!?；;：:])\s*/g, '$1')
       .trim();
 
-    return stripped || text.trim();
+    return stripped;
   }
 
   async readCachedAudio(fileName: string) {

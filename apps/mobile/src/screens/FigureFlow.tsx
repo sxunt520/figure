@@ -4,7 +4,7 @@ import {
 } from '@react-navigation/native-stack';
 import { useIsFocused } from '@react-navigation/native';
 import { StatusBar } from 'expo-status-bar';
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { BarcodeScanningResult, CameraView, useCameraPermissions } from 'expo-camera';
 import {
   ActivityIndicator,
@@ -13,6 +13,10 @@ import {
   Clipboard,
   ImageBackground,
   ImageSourcePropType,
+  KeyboardAvoidingView,
+  NativeScrollEvent,
+  NativeSyntheticEvent,
+  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -26,8 +30,10 @@ import { ConversationMessage, Device } from '../types';
 import {
   api,
   getApiBaseUrl,
+  isConversationStreamCancelled,
   normalizeApiBaseUrl,
   saveApiBaseUrl,
+  subscribeDeviceVoiceRecognition,
 } from '../api';
 import { palette } from '../theme';
 import { AlarmFlow } from './AlarmFlow';
@@ -178,7 +184,14 @@ function FigureStack({
         {() => <AlarmFlow token={token} device={device} />}
       </Stack.Screen>
       <Stack.Screen name="ConversationHistory" options={{ headerShown: false }}>
-        {(props) => <ConversationHistoryScreen {...props} device={device} messages={messages} />}
+        {(props) => (
+          <ConversationHistoryScreen
+            {...props}
+            device={device}
+            messages={messages}
+            token={token}
+          />
+        )}
       </Stack.Screen>
       <Stack.Screen name="MoodDiary" options={{ title: '心情日记' }}>
         {(props) => <MoodDiaryScreen {...props} />}
@@ -411,30 +424,386 @@ function MoodDiaryScreen({ navigation }: NativeStackScreenProps<FigureStackParam
   );
 }
 
+function mergeConversationMessages(
+  current: ConversationMessage[],
+  incoming: ConversationMessage[],
+) {
+  const persistedRequestKeys = new Set(
+    incoming
+      .filter(
+        (message) =>
+          message.source.startsWith('app:') &&
+          !message.id.startsWith('local-') &&
+          !message.id.startsWith('stream-'),
+      )
+      .map((message) => `${message.source}:${message.role}`),
+  );
+  const byId = new Map(
+    current
+      .filter(
+        (message) =>
+          !(
+            (message.id.startsWith('local-') || message.id.startsWith('stream-')) &&
+            persistedRequestKeys.has(`${message.source}:${message.role}`)
+          ),
+      )
+      .map((message) => [message.id, message]),
+  );
+  incoming.forEach((message) => byId.set(message.id, message));
+  return Array.from(byId.values()).sort(
+    (left, right) => {
+      if (
+        left.source.startsWith('app:') &&
+        left.source === right.source &&
+        left.role !== right.role
+      ) {
+        return left.role === 'user' ? -1 : 1;
+      }
+      return (
+        new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime()
+      );
+    },
+  );
+}
+
+const CONVERSATION_PAGE_SIZE = 30;
+
+function createConversationRequestId() {
+  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+interface FailedConversationRequest {
+  text: string;
+  clientRequestId: string;
+}
+
 function ConversationHistoryScreen({
   navigation,
   device,
   messages,
+  token,
 }: NativeStackScreenProps<FigureStackParamList, 'ConversationHistory'> & {
   device: Device | null;
   messages: ConversationMessage[];
+  token: string;
 }) {
+  const characterId =
+    device?.nfcTag?.matched && device.nfcTag.characterId
+      ? device.nfcTag.characterId
+      : device?.characterId ?? '';
+  const [localMessages, setLocalMessages] = useState(messages);
   const [hiddenIds, setHiddenIds] = useState<string[]>([]);
   const [menuMessageId, setMenuMessageId] = useState<string | null>(null);
   const [selecting, setSelecting] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [draft, setDraft] = useState('');
+  const [sending, setSending] = useState(false);
+  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
+  const [sendError, setSendError] = useState('');
+  const [failedRequest, setFailedRequest] = useState<FailedConversationRequest | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [voiceRecognition, setVoiceRecognition] = useState<{
+    phase: 'listening' | 'recognizing' | 'final' | 'error';
+    text: string;
+  } | null>(null);
+  const [hasOlder, setHasOlder] = useState(
+    messages.filter((message) => !characterId || message.characterId === characterId).length >=
+      CONVERSATION_PAGE_SIZE,
+  );
+  const scrollRef = useRef<ScrollView>(null);
+  const stickToBottomRef = useRef(true);
+  const initialScrollDoneRef = useRef(false);
+  const characterIdRef = useRef(characterId);
+  const loadingOlderRef = useRef(false);
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const activeStreamRef = useRef<FailedConversationRequest | null>(null);
+  const voiceClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(
+    () => () => {
+      activeStreamRef.current = null;
+      streamAbortRef.current?.abort();
+      streamAbortRef.current = null;
+      if (voiceClearTimerRef.current) clearTimeout(voiceClearTimerRef.current);
+    },
+    [],
+  );
 
   useEffect(() => {
-    setHiddenIds((current) => current.filter((id) => messages.some((message) => message.id === id)));
-    setSelectedIds((current) => current.filter((id) => messages.some((message) => message.id === id)));
-  }, [messages]);
+    if (!device?.id || !token) return undefined;
+    const stop = subscribeDeviceVoiceRecognition(token, device.id, (event) => {
+      if (voiceClearTimerRef.current) {
+        clearTimeout(voiceClearTimerRef.current);
+        voiceClearTimerRef.current = null;
+      }
+      stickToBottomRef.current = true;
+      if (event.type === 'voice.listening') {
+        setVoiceRecognition({ phase: 'listening', text: '正在聆听…' });
+      } else if (
+        event.type === 'voice.transcript.partial' ||
+        event.type === 'voice.transcript.sentence'
+      ) {
+        setVoiceRecognition({ phase: 'recognizing', text: event.text });
+      } else if (event.type === 'voice.transcript.final') {
+        setVoiceRecognition({
+          phase: 'final',
+          text: event.text || '没有听清，请再说一次',
+        });
+        voiceClearTimerRef.current = setTimeout(
+          () => setVoiceRecognition(null),
+          5000,
+        );
+      } else if (event.type === 'voice.error') {
+        setVoiceRecognition({ phase: 'error', text: event.message });
+        voiceClearTimerRef.current = setTimeout(
+          () => setVoiceRecognition(null),
+          3500,
+        );
+      }
+    });
+    return () => {
+      stop();
+      if (voiceClearTimerRef.current) clearTimeout(voiceClearTimerRef.current);
+      voiceClearTimerRef.current = null;
+    };
+  }, [device?.id, token]);
+
+  useEffect(() => {
+    const currentCharacterMessages = characterId
+      ? messages.filter((message) => message.characterId === characterId)
+      : messages;
+    if (characterIdRef.current !== characterId) {
+      activeStreamRef.current = null;
+      streamAbortRef.current?.abort();
+      streamAbortRef.current = null;
+      characterIdRef.current = characterId;
+      setLocalMessages(currentCharacterMessages);
+      setHiddenIds([]);
+      setSelectedIds([]);
+      setSelecting(false);
+      setSending(false);
+      setStreamingMessageId(null);
+      setSendError('');
+      setFailedRequest(null);
+      setHasOlder(currentCharacterMessages.length >= CONVERSATION_PAGE_SIZE);
+      initialScrollDoneRef.current = false;
+      stickToBottomRef.current = true;
+      return;
+    }
+    setLocalMessages((current) =>
+      mergeConversationMessages(
+        current.filter(
+          (message) =>
+            message.id.startsWith('stream-') ||
+            message.id.startsWith('local-') ||
+            !characterId ||
+            message.characterId === characterId,
+        ),
+        currentCharacterMessages,
+      ),
+    );
+  }, [characterId, messages]);
+
+  useEffect(() => {
+    setHiddenIds((current) => current.filter((id) => localMessages.some((message) => message.id === id)));
+    setSelectedIds((current) => current.filter((id) => localMessages.some((message) => message.id === id)));
+  }, [localMessages]);
 
   const visibleMessages = useMemo(
-    () => messages.filter((message) => !hiddenIds.includes(message.id)),
-    [hiddenIds, messages],
+    () => localMessages.filter((message) => !hiddenIds.includes(message.id)),
+    [hiddenIds, localMessages],
   );
   const selectedMessages = visibleMessages.filter((message) => selectedIds.includes(message.id));
-  const characterName = device?.character?.name ?? device?.nfcTag?.characterName ?? 'Suki';
+  const characterName =
+    device?.nfcTag?.matched && device.nfcTag.characterName
+      ? device.nfcTag.characterName
+      : device?.character?.name ?? 'Suki';
+  const latestMessageContent = visibleMessages[visibleMessages.length - 1]?.content ?? '';
+
+  const scrollToLatest = (animated: boolean) => {
+    requestAnimationFrame(() => scrollRef.current?.scrollToEnd({ animated }));
+  };
+
+  useEffect(() => {
+    if (stickToBottomRef.current) scrollToLatest(initialScrollDoneRef.current);
+  }, [latestMessageContent, visibleMessages.length, voiceRecognition?.text]);
+
+  const loadOlderMessages = async () => {
+    if (
+      !device ||
+      !hasOlder ||
+      loadingOlderRef.current ||
+      !initialScrollDoneRef.current
+    ) {
+      return;
+    }
+    const oldestMessage = visibleMessages.find(
+      (message) =>
+        !message.id.startsWith('local-') && !message.id.startsWith('stream-'),
+    );
+    if (!oldestMessage) return;
+
+    loadingOlderRef.current = true;
+    setLoadingOlder(true);
+    try {
+      const olderMessages = await api.listConversationMessages(
+        token,
+        device.id,
+        oldestMessage.createdAt,
+        CONVERSATION_PAGE_SIZE,
+      );
+      setLocalMessages((current) =>
+        mergeConversationMessages(current, olderMessages),
+      );
+      setHasOlder(olderMessages.length >= CONVERSATION_PAGE_SIZE);
+    } catch (error) {
+      setSendError(
+        error instanceof Error ? error.message : '更早的对话加载失败',
+      );
+    } finally {
+      loadingOlderRef.current = false;
+      setLoadingOlder(false);
+    }
+  };
+
+  const handleHistoryScroll = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+    stickToBottomRef.current =
+      contentSize.height - layoutMeasurement.height - contentOffset.y < 100;
+    if (contentOffset.y < 80) void loadOlderMessages();
+  };
+
+  const stopStreamingMessage = () => {
+    const activeRequest = activeStreamRef.current;
+    if (!activeRequest) return;
+    activeStreamRef.current = null;
+    streamAbortRef.current?.abort();
+    streamAbortRef.current = null;
+    setSending(false);
+    setStreamingMessageId(null);
+    setFailedRequest(activeRequest);
+    setSendError('已停止生成，可以重新发送这条消息');
+    setLocalMessages((current) =>
+      current.filter(
+        (message) =>
+          message.id !== `stream-assistant-${activeRequest.clientRequestId}`,
+      ),
+    );
+  };
+
+  const sendStreamingMessage = async (retryRequest?: FailedConversationRequest) => {
+    const text = retryRequest?.text ?? draft.trim();
+    if (!text || !device || !characterId || sending) return;
+
+    const clientRequestId =
+      retryRequest?.clientRequestId ?? createConversationRequestId();
+    const request = { text, clientRequestId };
+    const localUserId = `local-user-${clientRequestId}`;
+    const placeholderId = `stream-assistant-${clientRequestId}`;
+    const createdAt = new Date().toISOString();
+    let userMessageCreated = false;
+    const controller = new AbortController();
+    streamAbortRef.current?.abort();
+    streamAbortRef.current = controller;
+    activeStreamRef.current = request;
+    setDraft('');
+    setSendError('');
+    setFailedRequest(null);
+    setSending(true);
+    setStreamingMessageId(placeholderId);
+    stickToBottomRef.current = true;
+    setLocalMessages((current) => {
+      const source = `app:${clientRequestId}`;
+      const hasExistingUser = current.some(
+        (message) => message.role === 'user' && message.source === source,
+      );
+      return mergeConversationMessages(current, [
+        ...(hasExistingUser
+          ? []
+          : [
+              {
+                id: localUserId,
+                deviceId: device.id,
+                characterId,
+                role: 'user' as const,
+                content: text,
+                source,
+                createdAt,
+              },
+            ]),
+        {
+          id: placeholderId,
+          deviceId: device.id,
+          characterId,
+          role: 'assistant',
+          content: '',
+          source,
+          createdAt,
+        },
+      ]);
+    });
+
+    try {
+      await api.streamConversationMessage(
+        token,
+        device.id,
+        text,
+        (event) => {
+          if (activeStreamRef.current?.clientRequestId !== clientRequestId) return;
+          if (event.type === 'message.created') {
+            userMessageCreated = true;
+            setLocalMessages((current) =>
+              mergeConversationMessages(
+                current.filter((message) => message.id !== localUserId),
+                [event.message],
+              ),
+            );
+          } else if (event.type === 'message.delta') {
+            setLocalMessages((current) =>
+              current.map((message) =>
+                message.id === placeholderId
+                  ? { ...message, content: message.content + event.delta }
+                  : message,
+              ),
+            );
+          } else if (event.type === 'message.completed') {
+            setLocalMessages((current) =>
+              mergeConversationMessages(
+                current.filter((message) => message.id !== placeholderId),
+                [event.message],
+              ),
+            );
+          } else if (event.type === 'error') {
+            setSendError(event.message);
+          }
+        },
+        { clientRequestId, signal: controller.signal },
+      );
+    } catch (error) {
+      if (
+        activeStreamRef.current?.clientRequestId !== clientRequestId ||
+        isConversationStreamCancelled(error)
+      ) {
+        return;
+      }
+      setSendError(error instanceof Error ? error.message : '发送失败，请稍后重试');
+      setFailedRequest(request);
+      setLocalMessages((current) =>
+        current.filter(
+          (message) =>
+            message.id !== placeholderId &&
+            (userMessageCreated || message.id !== localUserId),
+        ),
+      );
+    } finally {
+      if (activeStreamRef.current?.clientRequestId === clientRequestId) {
+        activeStreamRef.current = null;
+        streamAbortRef.current = null;
+        setSending(false);
+        setStreamingMessageId(null);
+      }
+    }
+  };
 
   const deleteMessages = (ids: string[]) => {
     setHiddenIds((current) => Array.from(new Set([...current, ...ids])));
@@ -472,58 +841,169 @@ function ConversationHistoryScreen({
         <Text style={styles.historyTitle}>与{characterName}的对话记录</Text>
         <View style={styles.historyBack} />
       </View>
-      <ScrollView contentContainerStyle={[styles.historyContent, selecting && styles.historyContentSelecting]}>
-        {visibleMessages.length ? (
-          visibleMessages.map((message, index) => {
-            const previous = visibleMessages[index - 1];
-            const showTime = !previous || formatHistoryBucket(previous.createdAt) !== formatHistoryBucket(message.createdAt);
-            return (
-              <View key={message.id}>
-                {showTime ? <Text style={styles.historyTime}>{formatHistoryBucket(message.createdAt)}</Text> : null}
-                <ConversationBubble
-                  message={message}
-                  selecting={selecting}
-                  selected={selectedIds.includes(message.id)}
-                  menuVisible={menuMessageId === message.id}
-                  onToggle={() => toggleSelected(message.id)}
-                  onLongPress={() => setMenuMessageId(message.id)}
-                  onDelete={() => deleteMessages([message.id])}
-                  onSelect={() => enterSelecting(message.id)}
-                />
+      <KeyboardAvoidingView
+        style={styles.historyBody}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      >
+        <ScrollView
+          ref={scrollRef}
+          style={styles.historyScroll}
+          contentContainerStyle={[styles.historyContent, selecting && styles.historyContentSelecting]}
+          keyboardShouldPersistTaps="handled"
+          maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
+          scrollEventThrottle={32}
+          onScroll={handleHistoryScroll}
+          onContentSizeChange={() => {
+            if (!initialScrollDoneRef.current || stickToBottomRef.current) {
+              scrollToLatest(initialScrollDoneRef.current);
+              initialScrollDoneRef.current = true;
+            }
+          }}
+        >
+          {loadingOlder ? (
+            <View style={styles.historyOlderLoading}>
+              <ActivityIndicator size="small" color="#777777" />
+              <Text style={styles.historyOlderLoadingText}>正在加载更早的对话…</Text>
+            </View>
+          ) : null}
+          {visibleMessages.length ? (
+            visibleMessages.map((message, index) => {
+              const previous = visibleMessages[index - 1];
+              const showTime = !previous || formatHistoryBucket(previous.createdAt) !== formatHistoryBucket(message.createdAt);
+              return (
+                <View key={message.id}>
+                  {showTime ? <Text style={styles.historyTime}>{formatHistoryBucket(message.createdAt)}</Text> : null}
+                  <ConversationBubble
+                    message={message}
+                    streaming={streamingMessageId === message.id}
+                    selecting={selecting}
+                    selected={selectedIds.includes(message.id)}
+                    menuVisible={menuMessageId === message.id}
+                    onToggle={() => toggleSelected(message.id)}
+                    onLongPress={() => setMenuMessageId(message.id)}
+                    onDelete={() => deleteMessages([message.id])}
+                    onSelect={() => enterSelecting(message.id)}
+                  />
+                </View>
+              );
+            })
+          ) : (
+            <View style={styles.historyEmpty}>
+              <Text style={styles.centerTitle}>还没有对话记录</Text>
+              <Text style={styles.centerMuted}>在下面输入文字，就可以开始和角色聊天。</Text>
+            </View>
+          )}
+          {voiceRecognition ? (
+            <View
+              style={[
+                styles.voiceRecognitionCard,
+                voiceRecognition.phase === 'error' &&
+                  styles.voiceRecognitionCardError,
+              ]}
+            >
+              {voiceRecognition.phase === 'listening' ||
+              voiceRecognition.phase === 'recognizing' ? (
+                <ActivityIndicator size="small" color="#FFFFFF" />
+              ) : (
+                <Text style={styles.voiceRecognitionIcon}>
+                  {voiceRecognition.phase === 'error' ? '!' : '✓'}
+                </Text>
+              )}
+              <View style={styles.flex}>
+                <Text style={styles.voiceRecognitionLabel}>
+                  {voiceRecognition.phase === 'listening'
+                    ? '底座正在聆听'
+                    : voiceRecognition.phase === 'recognizing'
+                      ? '正在识别'
+                      : voiceRecognition.phase === 'final'
+                        ? '已识别'
+                        : '语音识别异常'}
+                </Text>
+                <Text style={styles.voiceRecognitionText}>
+                  {voiceRecognition.text}
+                </Text>
               </View>
-            );
-          })
+            </View>
+          ) : null}
+          <Text style={styles.historyHint}>长按对话气泡可进行更多操作</Text>
+        </ScrollView>
+        {selecting ? (
+          <View style={styles.historyBulkBar}>
+            <Pressable style={styles.historyBulkAction} disabled={!selectedMessages.length} onPress={copySelected}>
+              <Text style={styles.historyBulkIcon}>▣</Text>
+            </Pressable>
+            <Pressable
+              style={styles.historyBulkAction}
+              disabled={!selectedMessages.length}
+              onPress={() => Alert.alert('删除消息', `确定删除选中的 ${selectedMessages.length} 条消息吗？`, [
+                { text: '取消', style: 'cancel' },
+                { text: '删除', style: 'destructive', onPress: () => deleteMessages(selectedIds) },
+              ])}
+            >
+              <Text style={styles.historyBulkIcon}>⌫</Text>
+            </Pressable>
+          </View>
         ) : (
-          <View style={styles.historyEmpty}>
-            <Text style={styles.centerTitle}>还没有对话记录</Text>
-            <Text style={styles.centerMuted}>和角色聊过天后，这里会按时间显示历史消息。</Text>
+          <View style={styles.historyComposerArea}>
+            {sendError ? (
+              <View style={styles.historySendErrorRow}>
+                <Text style={styles.historySendError}>{sendError}</Text>
+                {failedRequest && !sending ? (
+                  <Pressable
+                    style={styles.historyRetryButton}
+                    onPress={() => void sendStreamingMessage(failedRequest)}
+                  >
+                    <Text style={styles.historyRetryButtonText}>重试</Text>
+                  </Pressable>
+                ) : null}
+              </View>
+            ) : null}
+            <View style={styles.historyComposer}>
+              <TextInput
+                value={draft}
+                onChangeText={setDraft}
+                style={styles.historyComposerInput}
+                placeholder={`和${characterName}说点什么…`}
+                placeholderTextColor="#999999"
+                multiline
+                maxLength={2000}
+                editable={!sending && Boolean(device && characterId)}
+                returnKeyType="send"
+                blurOnSubmit={false}
+                onSubmitEditing={() => {
+                  if (!sending) void sendStreamingMessage();
+                }}
+              />
+              <Pressable
+                style={[
+                  styles.historySendButton,
+                  !sending &&
+                    (!draft.trim() || !device || !characterId) &&
+                    styles.historySendButtonDisabled,
+                  sending && styles.historyStopButton,
+                ]}
+                disabled={!sending && (!draft.trim() || !device || !characterId)}
+                onPress={() =>
+                  sending
+                    ? stopStreamingMessage()
+                    : void sendStreamingMessage()
+                }
+              >
+                <Text style={styles.historySendButtonText}>
+                  {sending ? '停止' : '发送'}
+                </Text>
+              </Pressable>
+            </View>
           </View>
         )}
-        <Text style={styles.historyHint}>长按对话气泡可进行更多操作</Text>
-      </ScrollView>
-      {selecting ? (
-        <View style={styles.historyBulkBar}>
-          <Pressable style={styles.historyBulkAction} disabled={!selectedMessages.length} onPress={copySelected}>
-            <Text style={styles.historyBulkIcon}>▣</Text>
-          </Pressable>
-          <Pressable
-            style={styles.historyBulkAction}
-            disabled={!selectedMessages.length}
-            onPress={() => Alert.alert('删除消息', `确定删除选中的 ${selectedMessages.length} 条消息吗？`, [
-              { text: '取消', style: 'cancel' },
-              { text: '删除', style: 'destructive', onPress: () => deleteMessages(selectedIds) },
-            ])}
-          >
-            <Text style={styles.historyBulkIcon}>⌫</Text>
-          </Pressable>
-        </View>
-      ) : null}
+      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
 
 function ConversationBubble({
   message,
+  streaming,
   selecting,
   selected,
   menuVisible,
@@ -533,6 +1013,7 @@ function ConversationBubble({
   onSelect,
 }: {
   message: ConversationMessage;
+  streaming: boolean;
   selecting: boolean;
   selected: boolean;
   menuVisible: boolean;
@@ -564,12 +1045,14 @@ function ConversationBubble({
           </View>
         ) : null}
         <Pressable
-          onPress={selecting ? onToggle : undefined}
-          onLongPress={onLongPress}
+          onPress={selecting && !streaming ? onToggle : undefined}
+          onLongPress={streaming ? undefined : onLongPress}
           delayLongPress={350}
           style={[styles.messageBubble, mine ? styles.messageBubbleMine : styles.messageBubbleAssistant]}
         >
-          <Text style={[styles.messageText, mine && styles.messageTextMine]}>{message.content}</Text>
+          <Text style={[styles.messageText, mine && styles.messageTextMine]}>
+            {message.content || (streaming ? '正在回复…' : '')}{streaming && message.content ? ' ▍' : ''}
+          </Text>
         </Pressable>
       </View>
     </View>
@@ -1210,10 +1693,19 @@ const styles = StyleSheet.create({
   historyBack: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },
   historyBackText: { color: '#202020', fontSize: 43, lineHeight: 44, fontWeight: '300' },
   historyTitle: { color: '#111111', fontSize: 22, fontWeight: '500' },
+  historyBody: { flex: 1 },
+  historyScroll: { flex: 1 },
   historyContent: { paddingHorizontal: 22, paddingTop: 20, paddingBottom: 42, minHeight: '100%' },
   historyContentSelecting: { paddingBottom: 96 },
+  historyOlderLoading: { height: 42, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 },
+  historyOlderLoadingText: { color: '#888888', fontSize: 12 },
   historyTime: { color: '#888888', fontSize: 15, textAlign: 'center', marginBottom: 24, marginTop: 8 },
   historyHint: { color: '#D0D0D0', fontSize: 16, textAlign: 'center', marginTop: 38 },
+  voiceRecognitionCard: { alignSelf: 'flex-end', width: '78%', minHeight: 72, borderRadius: 22, borderBottomRightRadius: 4, backgroundColor: '#222222', paddingHorizontal: 16, paddingVertical: 12, flexDirection: 'row', alignItems: 'center', gap: 11, marginTop: 4, marginBottom: 4 },
+  voiceRecognitionCardError: { backgroundColor: '#B44842' },
+  voiceRecognitionIcon: { width: 20, color: '#FFFFFF', fontSize: 18, lineHeight: 22, fontWeight: '900', textAlign: 'center' },
+  voiceRecognitionLabel: { color: '#B8D16E', fontSize: 11, lineHeight: 16, fontWeight: '800' },
+  voiceRecognitionText: { color: '#FFFFFF', fontSize: 16, lineHeight: 23, marginTop: 2 },
   historyEmpty: { minHeight: 360, alignItems: 'center', justifyContent: 'center', gap: 8 },
   messageLine: { flexDirection: 'row', alignItems: 'center', marginBottom: 32 },
   messageLineMine: { justifyContent: 'flex-end' },
@@ -1232,9 +1724,20 @@ const styles = StyleSheet.create({
   messageMenuIcon: { color: '#FFFFFF', fontSize: 18, lineHeight: 20 },
   messageMenuText: { color: '#FFFFFF', fontSize: 14, fontWeight: '700' },
   messageMenuArrow: { position: 'absolute', left: 55, bottom: -10, width: 0, height: 0, borderLeftWidth: 10, borderRightWidth: 10, borderTopWidth: 10, borderLeftColor: 'transparent', borderRightColor: 'transparent', borderTopColor: '#666666' },
-  historyBulkBar: { position: 'absolute', left: 0, right: 0, bottom: 0, height: 65, backgroundColor: '#F1F1F1', borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: '#DDDDDD', flexDirection: 'row', alignItems: 'center', justifyContent: 'space-around' },
+  historyBulkBar: { height: 65, backgroundColor: '#F1F1F1', borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: '#DDDDDD', flexDirection: 'row', alignItems: 'center', justifyContent: 'space-around' },
   historyBulkAction: { width: 88, height: 56, alignItems: 'center', justifyContent: 'center' },
   historyBulkIcon: { color: '#686868', fontSize: 33, fontWeight: '700' },
+  historyComposerArea: { backgroundColor: '#FFFFFF', borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: '#E2E2E2', paddingHorizontal: 13, paddingTop: 9, paddingBottom: 9 },
+  historyComposer: { minHeight: 48, flexDirection: 'row', alignItems: 'flex-end', gap: 9 },
+  historyComposerInput: { flex: 1, minHeight: 46, maxHeight: 112, borderRadius: 23, backgroundColor: '#F1F1F1', color: '#181818', fontSize: 16, lineHeight: 22, paddingHorizontal: 17, paddingTop: 12, paddingBottom: 10 },
+  historySendButton: { width: 62, height: 46, borderRadius: 23, backgroundColor: '#000000', alignItems: 'center', justifyContent: 'center' },
+  historyStopButton: { backgroundColor: '#C84D46' },
+  historySendButtonDisabled: { backgroundColor: '#C9C9C9' },
+  historySendButtonText: { color: '#FFFFFF', fontSize: 15, fontWeight: '800' },
+  historySendErrorRow: { minHeight: 25, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginHorizontal: 7, marginBottom: 5 },
+  historySendError: { flex: 1, color: '#C53B35', fontSize: 12, lineHeight: 17 },
+  historyRetryButton: { minWidth: 48, height: 25, paddingHorizontal: 10, borderRadius: 13, backgroundColor: '#F1E2E0', alignItems: 'center', justifyContent: 'center' },
+  historyRetryButtonText: { color: '#B43B35', fontSize: 12, fontWeight: '800' },
   page: { padding: 20, paddingBottom: 42, gap: 16 },
   centerPage: { flex: 1, padding: 28, justifyContent: 'center', alignItems: 'center', gap: 14 },
   brandBlock: { backgroundColor: palette.ink, borderRadius: 28, padding: 24, marginBottom: 2 },
