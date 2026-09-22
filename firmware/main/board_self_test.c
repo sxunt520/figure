@@ -18,6 +18,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
+#include "esp_opus_enc.h"
 #include "esp_psram.h"
 #include "esp_spiffs.h"
 #include "esp_system.h"
@@ -48,11 +49,15 @@
 #define AUDIO_DOWNLOAD_MAX_BYTES (8U * 1024U * 1024U)
 #define MICROPHONE_SAMPLE_RATE 16000U
 #define MICROPHONE_MAX_RECORD_MS 10000U
+#define VOICE_OPUS_FRAME_DURATION_MS 20U
+#define VOICE_OPUS_FRAME_SAMPLES 320U
+#define VOICE_OPUS_BITRATE 24000
+#define VOICE_OPUS_MAX_PACKET_BYTES 1275U
 #define WAV_HEADER_BYTES 44U
 #define VOLUME_STEP 5U
 #define API_BASE_URL_CAPACITY 192U
 #define PROVISIONING_CONFIG_ENDPOINT "yuzhou-config"
-#define FIRMWARE_VERSION "0.10.0-dev"
+#define FIRMWARE_VERSION "0.11.0-dev"
 #define AUDIO_BASE_PATH "/audio"
 #define OFFLINE_ALARM_MAX_COUNT 8U
 #define OFFLINE_ALARM_STORE_MAGIC 0x59414c4dU
@@ -74,6 +79,7 @@ typedef enum {
 static const char *TAG = "figure_device";
 static char api_base_url[API_BASE_URL_CAPACITY] = CONFIG_FIGURE_API_BASE_URL;
 static led_strip_handle_t rgb_led;
+static SemaphoreHandle_t rgb_mutex;
 static EventGroupHandle_t wifi_events;
 static char access_token[ACCESS_TOKEN_CAPACITY];
 static uint8_t current_volume = 60;
@@ -89,6 +95,8 @@ static volatile bool talk_button_requested = false;
 static volatile bool talk_button_down = false;
 static volatile bool voice_reply_interrupt_requested = false;
 static TaskHandle_t figure_network_task_handle;
+static TaskHandle_t figure_voice_task_handle;
+static volatile bool talk_button_event_pending = false;
 static bool wifi_handler_registered = false;
 
 typedef struct {
@@ -147,6 +155,9 @@ static bool save_offline_alarm_store(void);
 static bool schedule_active_alarm_snooze(void);
 static void post_alarm_sync_event(const char *type, const char *revision,
                                   const char *message, uint16_t cached_count);
+#if defined(CONFIG_FIGURE_ENABLE_TALK_BUTTON) && defined(CONFIG_FIGURE_ENABLE_MICROPHONE)
+static void close_persistent_voice_websocket(void);
+#endif
 
 #ifdef CONFIG_FIGURE_ENABLE_DISPLAY
 static bool display_ready = false;
@@ -190,7 +201,7 @@ static const int16_t sine32[] = {
 static void speaker_write_silence(uint32_t duration_ms)
 {
     int16_t samples[128 * 2] = {0};
-    const size_t frames = (16000U * duration_ms) / 1000U;
+    const size_t frames = (speaker_sample_rate * duration_ms) / 1000U;
     size_t remaining = frames;
     while (remaining > 0) {
         const size_t block_frames = remaining > 128 ? 128 : remaining;
@@ -373,8 +384,8 @@ static bool speaker_play_wav(const uint8_t *wav, size_t wav_length)
     size_t position = 0;
     while (position + input_frame_bytes <= pcm_length) {
         if (playback_stop_requested) {
-            ESP_LOGI(TAG, "Playback stopped by function button");
-            speaker_write_silence(60);
+            ESP_LOGI(TAG, "Playback stopped by control or voice interruption");
+            speaker_write_silence(100);
             return true;
         }
         const size_t remaining_frames = (pcm_length - position) / input_frame_bytes;
@@ -574,6 +585,10 @@ static bool download_and_play_audio(const char *path, device_state_t playback_st
     bool played = false;
     if (speaker_mutex == NULL || xSemaphoreTake(speaker_mutex, portMAX_DELAY) == pdTRUE) {
         played = speaker_play_wav(audio, (size_t)received);
+        // Always terminate a downloaded clip with zero samples. Without this,
+        // the amplifier can hold a non-zero final frame and make a short buzz,
+        // especially when a reply is interrupted and recording starts at once.
+        speaker_write_silence(playback_stop_requested ? 100 : 60);
         if (speaker_mutex != NULL) xSemaphoreGive(speaker_mutex);
     }
     free(audio);
@@ -1361,19 +1376,44 @@ static void configure_display(void)
 
 static void set_rgb(uint8_t red, uint8_t green, uint8_t blue)
 {
-    ESP_ERROR_CHECK(led_strip_set_pixel(rgb_led, 0, red, green, blue));
-    ESP_ERROR_CHECK(led_strip_refresh(rgb_led));
+    if (rgb_led == NULL || rgb_mutex == NULL ||
+        xSemaphoreTake(rgb_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGW(TAG, "RGB update skipped: LED is busy or unavailable");
+        return;
+    }
+    esp_err_t error = led_strip_set_pixel(rgb_led, 0, red, green, blue);
+    if (error == ESP_OK) error = led_strip_refresh(rgb_led);
+    xSemaphoreGive(rgb_mutex);
+    if (error != ESP_OK) {
+        ESP_LOGW(TAG, "RGB update failed: %s", esp_err_to_name(error));
+    }
 }
 
 static void pulse_rgb(uint8_t red, uint8_t green, uint8_t blue, uint32_t duration_ms)
 {
-    set_rgb(red, green, blue);
+    if (rgb_led == NULL || rgb_mutex == NULL ||
+        xSemaphoreTake(rgb_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGW(TAG, "RGB pulse skipped: LED is busy or unavailable");
+        return;
+    }
+    esp_err_t error = led_strip_set_pixel(rgb_led, 0, red, green, blue);
+    if (error == ESP_OK) error = led_strip_refresh(rgb_led);
     vTaskDelay(pdMS_TO_TICKS(duration_ms));
-    ESP_ERROR_CHECK(led_strip_clear(rgb_led));
+    const esp_err_t clear_error = led_strip_clear(rgb_led);
+    xSemaphoreGive(rgb_mutex);
+    if (error != ESP_OK) {
+        ESP_LOGW(TAG, "RGB pulse update failed: %s", esp_err_to_name(error));
+    }
+    if (clear_error != ESP_OK) {
+        ESP_LOGW(TAG, "RGB pulse clear failed: %s",
+                 esp_err_to_name(clear_error));
+    }
 }
 
 static void configure_rgb_led(void)
 {
+    rgb_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(rgb_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     const led_strip_config_t strip_config = {
         .strip_gpio_num = CONFIG_BLINK_GPIO,
         .max_leds = 1,
@@ -1569,8 +1609,8 @@ static void talk_button_task(void *arg)
                     talk_button_down = true;
                     talk_button_requested = true;
                     ESP_LOGI(TAG, "Talk button pressed; push-to-talk starting");
-                    if (figure_network_task_handle != NULL) {
-                        xTaskNotifyGive(figure_network_task_handle);
+                    if (figure_voice_task_handle != NULL) {
+                        xTaskNotifyGive(figure_voice_task_handle);
                     }
                 } else {
                     ESP_LOGW(TAG, "Talk button ignored while state=%s",
@@ -2516,6 +2556,8 @@ static void nfc_event_uploader_task(void *arg)
 #define VOICE_WS_REPLY_AVAILABLE_BIT BIT4
 #define VOICE_WS_REPLY_COMPLETED_BIT BIT5
 #define VOICE_WS_DISCONNECTED_BIT BIT6
+#define VOICE_WS_IDLE_BIT BIT7
+#define VOICE_WS_CAPABILITIES_BIT BIT8
 #define VOICE_WS_REPLY_QUEUE_LENGTH 8U
 
 typedef struct {
@@ -2529,6 +2571,8 @@ typedef struct {
     QueueHandle_t reply_queue;
     char text[2048];
     bool has_text;
+    bool server_supports_opus;
+    TickType_t speech_ended_at;
 } voice_ws_context_t;
 
 typedef enum {
@@ -2536,6 +2580,9 @@ typedef enum {
     VOICE_STREAM_UNAVAILABLE,
     VOICE_STREAM_FAILED,
 } voice_stream_result_t;
+
+static esp_websocket_client_handle_t persistent_voice_ws_client = NULL;
+static voice_ws_context_t persistent_voice_ws_context = {0};
 
 static bool build_voice_websocket_url(char *output, size_t capacity)
 {
@@ -2592,7 +2639,12 @@ static void voice_websocket_event(void *handler_arg, esp_event_base_t base,
     if (event->payload_offset + event->data_len < event->payload_len) return;
     context->text[event->payload_len] = '\0';
     ESP_LOGI(TAG, "Voice WebSocket event: %s", context->text);
-    if (strstr(context->text, "\"type\":\"session.ready\"") != NULL) {
+    if (strstr(context->text,
+               "\"type\":\"session.capabilities\"") != NULL) {
+        context->server_supports_opus =
+            strstr(context->text, "\"opus\"") != NULL;
+        xEventGroupSetBits(context->events, VOICE_WS_CAPABILITIES_BIT);
+    } else if (strstr(context->text, "\"type\":\"session.ready\"") != NULL) {
         xEventGroupSetBits(context->events, VOICE_WS_READY_BIT);
     } else if (strstr(context->text,
                       "\"type\":\"conversation.accepted\"") != NULL) {
@@ -2635,6 +2687,8 @@ static void voice_websocket_event(void *handler_arg, esp_event_base_t base,
     } else if (strstr(context->text,
                       "\"type\":\"reply.completed\"") != NULL) {
         xEventGroupSetBits(context->events, VOICE_WS_REPLY_COMPLETED_BIT);
+    } else if (strstr(context->text, "\"type\":\"session.idle\"") != NULL) {
+        xEventGroupSetBits(context->events, VOICE_WS_IDLE_BIT);
     } else if (strstr(context->text, "\"type\":\"reply.error\"") != NULL) {
         xEventGroupSetBits(context->events, VOICE_WS_ERROR_BIT);
     } else if (strstr(context->text, "\"type\":\"error\"") != NULL) {
@@ -2650,8 +2704,32 @@ static bool voice_websocket_send_control(
         return false;
     }
     const int length = (int)strlen(message);
-    return esp_websocket_client_send_text(
-               client, message, length, pdMS_TO_TICKS(1500)) == length;
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        const int sent = esp_websocket_client_send_text(
+            client, message, length, pdMS_TO_TICKS(2000));
+        if (sent == length) return true;
+        if (sent > 0 || !esp_websocket_client_is_connected(client)) break;
+        vTaskDelay(pdMS_TO_TICKS(40U * (attempt + 1U)));
+    }
+    return false;
+}
+
+static bool voice_websocket_send_binary_frame(
+    esp_websocket_client_handle_t client, const void *data, int length)
+{
+    if (client == NULL || data == NULL || length <= 0 ||
+        !esp_websocket_client_is_connected(client)) {
+        return false;
+    }
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        const int sent = esp_websocket_client_send_bin(
+            client, (const char *)data, length, pdMS_TO_TICKS(2000));
+        if (sent == length) return true;
+        if (sent > 0 || !esp_websocket_client_is_connected(client)) break;
+        ESP_LOGW(TAG, "PCM frame send busy; retry=%u", attempt + 1U);
+        vTaskDelay(pdMS_TO_TICKS(30U * (attempt + 1U)));
+    }
+    return false;
 }
 
 static bool play_realtime_voice_reply(
@@ -2670,7 +2748,11 @@ static bool play_realtime_voice_reply(
             voice_reply_interrupt_requested = false;
             (void)voice_websocket_send_control(
                 client, "{\"type\":\"reply.interrupt\"}");
-            vTaskDelay(pdMS_TO_TICKS(50));
+            (void)xEventGroupWaitBits(
+                context->events,
+                VOICE_WS_IDLE_BIT | VOICE_WS_ERROR_BIT |
+                    VOICE_WS_DISCONNECTED_BIT,
+                pdTRUE, pdFALSE, pdMS_TO_TICKS(3000));
             ESP_LOGI(TAG, "Realtime reply interrupted for a new voice turn");
             device_set_state(DEVICE_STATE_IDLE);
             return true;
@@ -2681,6 +2763,12 @@ static bool play_realtime_voice_reply(
             if (voice_reply_interrupt_requested) break;
             ESP_LOGI(TAG, "Playing realtime reply sequence=%d command=%s",
                      reply.sequence, reply.command_id);
+            if (reply.sequence == 0 && context->speech_ended_at != 0) {
+                ESP_LOGI(TAG, "Voice first-audio latency=%" PRIu32 "ms",
+                         (uint32_t)((xTaskGetTickCount() -
+                                     context->speech_ended_at) *
+                                    portTICK_PERIOD_MS));
+            }
             bool played = true;
             if (!sleep_mode_enabled) {
 #ifdef CONFIG_FIGURE_ENABLE_SPEAKER
@@ -2715,8 +2803,14 @@ static bool play_realtime_voice_reply(
 
         if (voice_reply_interrupt_requested) continue;
         if (reply_completed && uxQueueMessagesWaiting(context->reply_queue) == 0) {
-            (void)voice_websocket_send_control(client,
-                                               "{\"type\":\"reply.done\"}");
+            if (voice_websocket_send_control(
+                    client, "{\"type\":\"reply.done\"}")) {
+                (void)xEventGroupWaitBits(
+                    context->events,
+                    VOICE_WS_IDLE_BIT | VOICE_WS_ERROR_BIT |
+                        VOICE_WS_DISCONNECTED_BIT,
+                    pdTRUE, pdFALSE, pdMS_TO_TICKS(3000));
+            }
             device_set_state(DEVICE_STATE_IDLE);
             return true;
         }
@@ -2730,19 +2824,22 @@ static bool play_realtime_voice_reply(
         if ((bits & VOICE_WS_DISCONNECTED_BIT) != 0) {
             ESP_LOGW(TAG,
                      "Realtime reply socket disconnected; using command polling fallback");
-            device_set_state(DEVICE_STATE_THINKING);
+            close_persistent_voice_websocket();
+            device_set_state(DEVICE_STATE_IDLE);
             return true;
         }
         if ((bits & VOICE_WS_ERROR_BIT) != 0) {
             ESP_LOGW(TAG,
                      "Realtime reply failed; using command polling fallback");
-            device_set_state(DEVICE_STATE_THINKING);
+            close_persistent_voice_websocket();
+            device_set_state(DEVICE_STATE_IDLE);
             return true;
         }
     }
 
     ESP_LOGW(TAG, "Realtime reply timed out; using command polling fallback");
-    device_set_state(DEVICE_STATE_THINKING);
+    close_persistent_voice_websocket();
+    device_set_state(DEVICE_STATE_IDLE);
     return true;
 }
 
@@ -2759,14 +2856,186 @@ static void delete_voice_ws_context(voice_ws_context_t *context)
     }
 }
 
-static bool stream_microphone_pcm(esp_websocket_client_handle_t client,
-                                  uint32_t duration_ms,
-                                  bool stop_on_button_release)
+static void close_persistent_voice_websocket(void)
+{
+    if (persistent_voice_ws_client != NULL) {
+        if (esp_websocket_client_is_connected(persistent_voice_ws_client)) {
+            (void)esp_websocket_client_close(persistent_voice_ws_client,
+                                             pdMS_TO_TICKS(1000));
+        }
+        (void)esp_websocket_client_stop(persistent_voice_ws_client);
+        (void)esp_websocket_client_destroy(persistent_voice_ws_client);
+        persistent_voice_ws_client = NULL;
+    }
+    delete_voice_ws_context(&persistent_voice_ws_context);
+    memset(&persistent_voice_ws_context, 0,
+           sizeof(persistent_voice_ws_context));
+}
+
+static void reset_voice_websocket_turn(voice_ws_context_t *context)
+{
+    if (context == NULL || context->events == NULL ||
+        context->reply_queue == NULL) {
+        return;
+    }
+    xEventGroupClearBits(
+        context->events,
+        VOICE_WS_READY_BIT | VOICE_WS_ACCEPTED_BIT | VOICE_WS_ERROR_BIT |
+            VOICE_WS_REPLY_AVAILABLE_BIT | VOICE_WS_REPLY_COMPLETED_BIT |
+            VOICE_WS_DISCONNECTED_BIT | VOICE_WS_IDLE_BIT);
+    xQueueReset(context->reply_queue);
+    context->text[0] = '\0';
+    context->has_text = false;
+    context->speech_ended_at = 0;
+}
+
+static bool ensure_persistent_voice_websocket(void)
+{
+    if (persistent_voice_ws_client != NULL &&
+        persistent_voice_ws_context.events != NULL &&
+        esp_websocket_client_is_connected(persistent_voice_ws_client)) {
+        return true;
+    }
+
+    close_persistent_voice_websocket();
+    char uri[256];
+    if (!build_voice_websocket_url(uri, sizeof(uri))) return false;
+    persistent_voice_ws_context.events = xEventGroupCreate();
+    persistent_voice_ws_context.reply_queue = xQueueCreate(
+        VOICE_WS_REPLY_QUEUE_LENGTH, sizeof(voice_reply_audio_t));
+    if (persistent_voice_ws_context.events == NULL ||
+        persistent_voice_ws_context.reply_queue == NULL) {
+        close_persistent_voice_websocket();
+        return false;
+    }
+
+    const esp_websocket_client_config_t config = {
+        .uri = uri,
+        .disable_auto_reconnect = true,
+        .task_stack = 6144,
+        .buffer_size = 2048,
+        .network_timeout_ms = 5000,
+        .ping_interval_sec = 15,
+        .pingpong_timeout_sec = 10,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    persistent_voice_ws_client = esp_websocket_client_init(&config);
+    if (persistent_voice_ws_client == NULL) {
+        close_persistent_voice_websocket();
+        return false;
+    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_websocket_register_events(
+        persistent_voice_ws_client, WEBSOCKET_EVENT_ANY,
+        voice_websocket_event, &persistent_voice_ws_context));
+    if (esp_websocket_client_start(persistent_voice_ws_client) != ESP_OK) {
+        close_persistent_voice_websocket();
+        return false;
+    }
+    const EventBits_t bits = xEventGroupWaitBits(
+        persistent_voice_ws_context.events,
+        VOICE_WS_CONNECTED_BIT | VOICE_WS_ERROR_BIT |
+            VOICE_WS_DISCONNECTED_BIT,
+        pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));
+    if ((bits & VOICE_WS_CONNECTED_BIT) == 0) {
+        ESP_LOGW(TAG, "Persistent voice WebSocket unavailable: %s", uri);
+        close_persistent_voice_websocket();
+        return false;
+    }
+    ESP_LOGI(TAG, "Persistent voice WebSocket connected: %s", uri);
+    (void)xEventGroupWaitBits(
+        persistent_voice_ws_context.events,
+        VOICE_WS_CAPABILITIES_BIT | VOICE_WS_ERROR_BIT |
+            VOICE_WS_DISCONNECTED_BIT,
+        pdFALSE, pdFALSE, pdMS_TO_TICKS(1000));
+    ESP_LOGI(TAG, "Voice uplink negotiated: %s",
+             persistent_voice_ws_context.server_supports_opus
+                 ? "opus/16k/mono/20ms"
+                 : "pcm_s16le/16k/mono");
+    return true;
+}
+
+static void *open_voice_opus_encoder(void)
+{
+    esp_opus_enc_config_t config = ESP_OPUS_ENC_CONFIG_DEFAULT();
+    config.sample_rate = MICROPHONE_SAMPLE_RATE;
+    config.channel = 1;
+    config.bits_per_sample = 16;
+    config.bitrate = VOICE_OPUS_BITRATE;
+    config.frame_duration = ESP_OPUS_ENC_FRAME_DURATION_20_MS;
+    config.application_mode = ESP_OPUS_ENC_APPLICATION_VOIP;
+    config.complexity = 3;
+    config.enable_fec = false;
+    config.enable_dtx = false;
+    config.enable_vbr = true;
+
+    void *encoder = NULL;
+    const esp_audio_err_t opened = esp_opus_enc_open(
+        &config, sizeof(config), &encoder);
+    if (opened != ESP_AUDIO_ERR_OK || encoder == NULL) {
+        ESP_LOGW(TAG, "Opus encoder unavailable; using PCM fallback (error=%d)",
+                 opened);
+        return NULL;
+    }
+    int input_size = 0;
+    int output_size = 0;
+    const esp_audio_err_t sized = esp_opus_enc_get_frame_size(
+        encoder, &input_size, &output_size);
+    if (sized != ESP_AUDIO_ERR_OK ||
+        input_size != (int)(VOICE_OPUS_FRAME_SAMPLES * sizeof(int16_t)) ||
+        output_size <= 0 || output_size > (int)VOICE_OPUS_MAX_PACKET_BYTES) {
+        ESP_LOGW(TAG,
+                 "Unexpected Opus frame sizes input=%d output=%d error=%d; using PCM fallback",
+                 input_size, output_size, sized);
+        esp_opus_enc_close(encoder);
+        return NULL;
+    }
+    ESP_LOGI(TAG, "Opus encoder ready: bitrate=%d frame=%ums maxPacket=%d",
+             VOICE_OPUS_BITRATE, VOICE_OPUS_FRAME_DURATION_MS, output_size);
+    return encoder;
+}
+
+static bool send_voice_opus_frame(esp_websocket_client_handle_t client,
+                                  void *encoder, int16_t *pcm,
+                                  uint32_t *wire_bytes)
+{
+    uint8_t packet[VOICE_OPUS_MAX_PACKET_BYTES];
+    esp_audio_enc_in_frame_t input = {
+        .buffer = (uint8_t *)pcm,
+        .len = VOICE_OPUS_FRAME_SAMPLES * sizeof(int16_t),
+    };
+    esp_audio_enc_out_frame_t output = {
+        .buffer = packet,
+        .len = sizeof(packet),
+    };
+    const esp_audio_err_t encoded = esp_opus_enc_process(
+        encoder, &input, &output);
+    if (encoded != ESP_AUDIO_ERR_OK || output.encoded_bytes == 0 ||
+        output.encoded_bytes > sizeof(packet)) {
+        ESP_LOGE(TAG, "Opus encode failed: error=%d bytes=%" PRIu32,
+                 encoded, output.encoded_bytes);
+        return false;
+    }
+    if (!voice_websocket_send_binary_frame(
+            client, packet, (int)output.encoded_bytes)) {
+        ESP_LOGE(TAG, "Unable to send microphone Opus frame");
+        return false;
+    }
+    if (wire_bytes != NULL) *wire_bytes += output.encoded_bytes;
+    return true;
+}
+
+static bool stream_microphone_audio(esp_websocket_client_handle_t client,
+                                    uint32_t duration_ms,
+                                    bool stop_on_button_release,
+                                    void *opus_encoder)
 {
     const uint32_t max_frame_count =
         (MICROPHONE_SAMPLE_RATE * duration_ms) / 1000U;
     int32_t input[128 * 2];
     int16_t pcm[128];
+    int16_t opus_pcm[VOICE_OPUS_FRAME_SAMPLES];
+    size_t opus_pcm_count = 0;
+    uint32_t wire_bytes = 0;
     size_t discarded = 0;
     (void)i2s_channel_read(microphone_rx_channel, input, sizeof(input),
                            &discarded, pdMS_TO_TICKS(100));
@@ -2816,12 +3085,35 @@ static bool stream_microphone_pcm(esp_websocket_client_handle_t client,
             absolute_sum += absolute;
             if (absolute > peak) peak = absolute;
         }
-        const int pcm_bytes = (int)(copy_frames * sizeof(int16_t));
-        if (esp_websocket_client_send_bin(client, (const char *)pcm,
-                                          pcm_bytes,
-                                          pdMS_TO_TICKS(1500)) != pcm_bytes) {
-            ESP_LOGE(TAG, "Unable to send microphone PCM frame");
-            return false;
+        if (opus_encoder == NULL) {
+            const int pcm_bytes = (int)(copy_frames * sizeof(int16_t));
+            if (!voice_websocket_send_binary_frame(client, pcm, pcm_bytes)) {
+                ESP_LOGE(TAG, "Unable to send microphone PCM frame");
+                return false;
+            }
+            wire_bytes += (uint32_t)pcm_bytes;
+        } else {
+            size_t source_position = 0;
+            while (source_position < copy_frames) {
+                const size_t available = VOICE_OPUS_FRAME_SAMPLES -
+                                         opus_pcm_count;
+                const size_t remaining = copy_frames - source_position;
+                const size_t copied = available < remaining
+                                          ? available
+                                          : remaining;
+                memcpy(opus_pcm + opus_pcm_count,
+                       pcm + source_position,
+                       copied * sizeof(int16_t));
+                opus_pcm_count += copied;
+                source_position += copied;
+                if (opus_pcm_count == VOICE_OPUS_FRAME_SAMPLES) {
+                    if (!send_voice_opus_frame(client, opus_encoder,
+                                               opus_pcm, &wire_bytes)) {
+                        return false;
+                    }
+                    opus_pcm_count = 0;
+                }
+            }
         }
         written_frames += (uint32_t)copy_frames;
 
@@ -2882,10 +3174,24 @@ static bool stream_microphone_pcm(esp_websocket_client_handle_t client,
         }
     }
 
-    ESP_LOGI(TAG, "Microphone PCM stream ready: duration=%" PRIu32
-                  "ms bytes=%u speech=%s",
+    if (opus_encoder != NULL && opus_pcm_count > 0) {
+        memset(opus_pcm + opus_pcm_count, 0,
+               (VOICE_OPUS_FRAME_SAMPLES - opus_pcm_count) *
+                   sizeof(int16_t));
+        if (!send_voice_opus_frame(client, opus_encoder, opus_pcm,
+                                   &wire_bytes)) {
+            return false;
+        }
+    }
+
+    const uint32_t pcm_bytes = written_frames * sizeof(int16_t);
+    ESP_LOGI(TAG, "Microphone %s stream ready: duration=%" PRIu32
+                  "ms wireBytes=%" PRIu32 " pcmBytes=%" PRIu32
+                  " ratio=%.2f speech=%s",
+             opus_encoder == NULL ? "PCM" : "Opus",
              (written_frames * 1000U) / MICROPHONE_SAMPLE_RATE,
-             (unsigned)(written_frames * sizeof(int16_t)),
+             wire_bytes, pcm_bytes,
+             wire_bytes > 0 ? (double)pcm_bytes / (double)wire_bytes : 1.0,
              speech_detected ? "yes" : "no");
     return true;
 }
@@ -2894,54 +3200,20 @@ static voice_stream_result_t record_and_stream_websocket(
     const char *command_id, uint32_t duration_ms, bool push_to_talk)
 {
     voice_reply_interrupt_requested = false;
-    char uri[256];
-    if (!build_voice_websocket_url(uri, sizeof(uri))) {
-        ESP_LOGW(TAG, "Unable to build voice WebSocket URL from %s",
-                 api_base_url);
+    const TickType_t turn_started_at = xTaskGetTickCount();
+    if (!ensure_persistent_voice_websocket()) {
         return VOICE_STREAM_UNAVAILABLE;
     }
+    const TickType_t connected_at = xTaskGetTickCount();
+    esp_websocket_client_handle_t client = persistent_voice_ws_client;
+    voice_ws_context_t *context = &persistent_voice_ws_context;
+    reset_voice_websocket_turn(context);
 
-    voice_ws_context_t context = {
-        .events = xEventGroupCreate(),
-        .reply_queue = xQueueCreate(VOICE_WS_REPLY_QUEUE_LENGTH,
-                                   sizeof(voice_reply_audio_t)),
-        .text = {0},
-        .has_text = false,
-    };
-    if (context.events == NULL || context.reply_queue == NULL) {
-        delete_voice_ws_context(&context);
-        return VOICE_STREAM_UNAVAILABLE;
-    }
-    const esp_websocket_client_config_t config = {
-        .uri = uri,
-        .disable_auto_reconnect = true,
-        .task_stack = 6144,
-        .buffer_size = 2048,
-        .network_timeout_ms = 5000,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-    };
-    esp_websocket_client_handle_t client = esp_websocket_client_init(&config);
-    if (client == NULL) {
-        delete_voice_ws_context(&context);
-        return VOICE_STREAM_UNAVAILABLE;
-    }
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_websocket_register_events(
-        client, WEBSOCKET_EVENT_ANY, voice_websocket_event, &context));
-    if (esp_websocket_client_start(client) != ESP_OK) {
-        esp_websocket_client_destroy(client);
-        delete_voice_ws_context(&context);
-        return VOICE_STREAM_UNAVAILABLE;
-    }
-
-    EventBits_t bits = xEventGroupWaitBits(
-        context.events, VOICE_WS_CONNECTED_BIT | VOICE_WS_ERROR_BIT,
-        pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));
-    if ((bits & VOICE_WS_CONNECTED_BIT) == 0) {
-        ESP_LOGW(TAG, "Voice WebSocket connection unavailable: %s", uri);
-        esp_websocket_client_stop(client);
-        esp_websocket_client_destroy(client);
-        delete_voice_ws_context(&context);
-        return VOICE_STREAM_UNAVAILABLE;
+    void *opus_encoder = NULL;
+    bool use_opus = context->server_supports_opus;
+    if (use_opus) {
+        opus_encoder = open_voice_opus_encoder();
+        if (opus_encoder == NULL) use_opus = false;
     }
 
     char start[320];
@@ -2950,65 +3222,86 @@ static voice_stream_result_t record_and_stream_websocket(
         start_length = snprintf(
             start, sizeof(start),
             "{\"type\":\"audio.start\",\"token\":\"%s\","
-            "\"format\":\"pcm_s16le\",\"sampleRate\":16000,"
-            "\"channels\":1,\"commandId\":\"%s\",\"pushToTalk\":%s}",
-            access_token, command_id, push_to_talk ? "true" : "false");
+            "\"format\":\"%s\",\"sampleRate\":16000,"
+            "\"channels\":1,\"frameDurationMs\":%u,"
+            "\"commandId\":\"%s\",\"pushToTalk\":%s}",
+            access_token, use_opus ? "opus" : "pcm_s16le",
+            VOICE_OPUS_FRAME_DURATION_MS, command_id,
+            push_to_talk ? "true" : "false");
     } else {
         start_length = snprintf(
             start, sizeof(start),
             "{\"type\":\"audio.start\",\"token\":\"%s\","
-            "\"format\":\"pcm_s16le\",\"sampleRate\":16000,"
-            "\"channels\":1,\"commandId\":null,\"pushToTalk\":%s}",
-            access_token, push_to_talk ? "true" : "false");
+            "\"format\":\"%s\",\"sampleRate\":16000,"
+            "\"channels\":1,\"frameDurationMs\":%u,"
+            "\"commandId\":null,\"pushToTalk\":%s}",
+            access_token, use_opus ? "opus" : "pcm_s16le",
+            VOICE_OPUS_FRAME_DURATION_MS,
+            push_to_talk ? "true" : "false");
     }
     if (start_length <= 0 || start_length >= (int)sizeof(start) ||
-        esp_websocket_client_send_text(client, start, start_length,
-                                       pdMS_TO_TICKS(1500)) != start_length) {
-        esp_websocket_client_stop(client);
-        esp_websocket_client_destroy(client);
-        delete_voice_ws_context(&context);
+        !voice_websocket_send_control(client, start)) {
+        if (opus_encoder != NULL) esp_opus_enc_close(opus_encoder);
+        close_persistent_voice_websocket();
         return VOICE_STREAM_UNAVAILABLE;
     }
-    bits = xEventGroupWaitBits(
-        context.events, VOICE_WS_READY_BIT | VOICE_WS_ERROR_BIT,
+    EventBits_t bits = xEventGroupWaitBits(
+        context->events,
+        VOICE_WS_READY_BIT | VOICE_WS_ERROR_BIT | VOICE_WS_DISCONNECTED_BIT,
         pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));
     if ((bits & VOICE_WS_READY_BIT) == 0) {
         ESP_LOGW(TAG, "Voice WebSocket authentication failed");
-        esp_websocket_client_stop(client);
-        esp_websocket_client_destroy(client);
-        delete_voice_ws_context(&context);
+        if (opus_encoder != NULL) esp_opus_enc_close(opus_encoder);
+        close_persistent_voice_websocket();
         return VOICE_STREAM_UNAVAILABLE;
     }
+    const TickType_t ready_at = xTaskGetTickCount();
+    ESP_LOGI(TAG,
+             "Voice turn ready: connect=%" PRIu32 "ms auth=%" PRIu32 "ms",
+             (uint32_t)((connected_at - turn_started_at) * portTICK_PERIOD_MS),
+             (uint32_t)((ready_at - connected_at) * portTICK_PERIOD_MS));
 
     device_set_state(DEVICE_STATE_LISTENING);
-    const bool recorded = stream_microphone_pcm(client, duration_ms,
-                                                push_to_talk);
+    const bool recorded = stream_microphone_audio(
+        client, duration_ms, push_to_talk, opus_encoder);
+    if (opus_encoder != NULL) {
+        esp_opus_enc_close(opus_encoder);
+        opus_encoder = NULL;
+    }
     voice_stream_result_t result = VOICE_STREAM_FAILED;
     if (recorded && esp_websocket_client_is_connected(client)) {
         device_set_state(DEVICE_STATE_UPLOADING);
+        context->speech_ended_at = xTaskGetTickCount();
         static const char end[] = "{\"type\":\"audio.end\"}";
-        if (esp_websocket_client_send_text(client, end, sizeof(end) - 1,
-                                           pdMS_TO_TICKS(1500)) ==
-            (int)(sizeof(end) - 1)) {
+        if (voice_websocket_send_control(client, end)) {
             bits = xEventGroupWaitBits(
-                context.events, VOICE_WS_ACCEPTED_BIT | VOICE_WS_ERROR_BIT,
+                context->events,
+                VOICE_WS_ACCEPTED_BIT | VOICE_WS_ERROR_BIT |
+                    VOICE_WS_DISCONNECTED_BIT,
                 pdFALSE, pdFALSE, pdMS_TO_TICKS(35000));
             if ((bits & VOICE_WS_ACCEPTED_BIT) != 0) {
-                if (context.has_text) {
-                    (void)play_realtime_voice_reply(client, &context);
+                ESP_LOGI(TAG, "Voice recognition latency=%" PRIu32 "ms",
+                         (uint32_t)((xTaskGetTickCount() -
+                                     context->speech_ended_at) *
+                                    portTICK_PERIOD_MS));
+                if (context->has_text) {
+                    (void)play_realtime_voice_reply(client, context);
                 } else {
+                    (void)xEventGroupWaitBits(
+                        context->events,
+                        VOICE_WS_IDLE_BIT | VOICE_WS_ERROR_BIT |
+                            VOICE_WS_DISCONNECTED_BIT,
+                        pdTRUE, pdFALSE, pdMS_TO_TICKS(3000));
                     device_set_state(DEVICE_STATE_IDLE);
                 }
                 result = VOICE_STREAM_SUCCESS;
             }
         }
     }
-    if (result != VOICE_STREAM_SUCCESS) device_set_state(DEVICE_STATE_ERROR);
-    if (esp_websocket_client_is_connected(client)) {
-        (void)esp_websocket_client_close(client, pdMS_TO_TICKS(1000));
+    if (result != VOICE_STREAM_SUCCESS) {
+        device_set_state(DEVICE_STATE_ERROR);
+        close_persistent_voice_websocket();
     }
-    esp_websocket_client_destroy(client);
-    delete_voice_ws_context(&context);
     return result;
 }
 
@@ -3032,17 +3325,18 @@ static bool record_and_upload_http(const char *command_id,
     } else {
         strlcpy(path, "/device/conversation/audio", sizeof(path));
     }
+    http_response_t response = {0};
     const int status = http_binary_post(path, wav, wav_size, "audio/wav",
-                                        &http_response);
+                                        &response);
     free(wav);
     if (status != 200 && status != 201) {
         ESP_LOGE(TAG, "Recording upload failed, HTTP status=%d, response=%s",
-                 status, http_response.data);
+                 status, response.data);
         device_set_state(DEVICE_STATE_ERROR);
         return false;
     }
 
-    cJSON *root = cJSON_Parse(http_response.data);
+    cJSON *root = cJSON_Parse(response.data);
     const cJSON *accepted =
         root == NULL ? NULL : cJSON_GetObjectItemCaseSensitive(root, "accepted");
     const cJSON *text =
@@ -3054,7 +3348,7 @@ static bool record_and_upload_http(const char *command_id,
                              ? DEVICE_STATE_IDLE
                              : DEVICE_STATE_THINKING);
     } else {
-        ESP_LOGE(TAG, "Invalid ASR response: %s", http_response.data);
+        ESP_LOGE(TAG, "Invalid ASR response: %s", response.data);
         device_set_state(DEVICE_STATE_ERROR);
     }
     cJSON_Delete(root);
@@ -3595,16 +3889,10 @@ static void figure_network_task(void *arg)
 #endif
 
 #if defined(CONFIG_FIGURE_ENABLE_TALK_BUTTON) && defined(CONFIG_FIGURE_ENABLE_MICROPHONE)
-        if (talk_button_requested) {
-            talk_button_requested = false;
-            if (device_bound && device_state == DEVICE_STATE_IDLE) {
-                post_device_event("button_pressed", "对话按键已按下", "start_listening");
-                (void)record_and_upload(NULL, MICROPHONE_MAX_RECORD_MS, true);
-            } else {
-                ESP_LOGW(TAG, "Talk request ignored: bound=%s state=%s",
-                         device_bound ? "yes" : "no",
-                         device_state_label(device_state));
-            }
+        if (talk_button_event_pending) {
+            talk_button_event_pending = false;
+            post_device_event("button_pressed", "对话按键已按下",
+                              "start_listening");
         }
 #endif
 
@@ -3612,8 +3900,10 @@ static void figure_network_task(void *arg)
         if (heartbeat_status == 401) {
             access_token[0] = '\0';
         } else if (heartbeat_status == 200 || heartbeat_status == 201) {
-            const int command_status = fetch_commands();
-            if (command_status == 401) access_token[0] = '\0';
+            if (device_state == DEVICE_STATE_IDLE) {
+                const int command_status = fetch_commands();
+                if (command_status == 401) access_token[0] = '\0';
+            }
             if (device_state == DEVICE_STATE_IDLE) {
                 if (sleep_mode_enabled) {
                     set_rgb(0, 0, 0);
@@ -3632,6 +3922,44 @@ static void figure_network_task(void *arg)
                                pdMS_TO_TICKS(CONFIG_FIGURE_HEARTBEAT_INTERVAL_MS));
     }
 }
+
+#if defined(CONFIG_FIGURE_ENABLE_TALK_BUTTON) && defined(CONFIG_FIGURE_ENABLE_MICROPHONE)
+static void figure_voice_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        const EventBits_t wifi_bits = wifi_events == NULL
+                                         ? 0
+                                         : xEventGroupGetBits(wifi_events);
+        if (device_bound && access_token[0] != '\0' &&
+            (wifi_bits & WIFI_CONNECTED_BIT) != 0 &&
+            device_state == DEVICE_STATE_IDLE &&
+            (persistent_voice_ws_client == NULL ||
+             !esp_websocket_client_is_connected(
+                 persistent_voice_ws_client))) {
+            (void)ensure_persistent_voice_websocket();
+        }
+
+        if (talk_button_requested) {
+            talk_button_requested = false;
+            if (device_bound && access_token[0] != '\0' &&
+                device_state == DEVICE_STATE_IDLE) {
+                talk_button_event_pending = true;
+                if (figure_network_task_handle != NULL) {
+                    xTaskNotifyGive(figure_network_task_handle);
+                }
+                (void)record_and_upload(NULL, MICROPHONE_MAX_RECORD_MS, true);
+                continue;
+            }
+            ESP_LOGW(TAG, "Talk request ignored: bound=%s state=%s",
+                     device_bound ? "yes" : "no",
+                     device_state_label(device_state));
+        }
+
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+    }
+}
+#endif
 
 void app_main(void)
 {
@@ -3681,6 +4009,12 @@ void app_main(void)
     }
     xTaskCreate(figure_network_task, "figure_network", 24576, NULL, 5,
                 &figure_network_task_handle);
+#if defined(CONFIG_FIGURE_ENABLE_TALK_BUTTON) && defined(CONFIG_FIGURE_ENABLE_MICROPHONE)
+    if (xTaskCreate(figure_voice_task, "figure_voice", 24576, NULL, 6,
+                    &figure_voice_task_handle) != pdPASS) {
+        ESP_LOGE(TAG, "Unable to start realtime voice task");
+    }
+#endif
 #ifdef CONFIG_FIGURE_ENABLE_NFC
     if (nfc_event_queue != NULL &&
         xTaskCreate(nfc_event_uploader_task, "nfc_uploader", 10240, NULL, 4,

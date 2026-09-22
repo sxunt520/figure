@@ -243,9 +243,12 @@ export class TtsService {
 
   normalizeForSpeech(text: string) {
     const stripped = text
-      .replace(/[（(【\[]([^（）()【】\[\]]{1,24})[）)】\]]/g, (matched, inner) => {
+      .replace(/[（(【\[]([^（）()【】\[\]]{1,40})[）)】\]]/g, (matched, inner, offset) => {
         const cue = String(inner).trim();
-        if (this.stageDirectionKeywords.some((keyword) => cue.includes(keyword))) {
+        if (
+          offset === 0 ||
+          this.stageDirectionKeywords.some((keyword) => cue.includes(keyword))
+        ) {
           return '';
         }
         return matched;
