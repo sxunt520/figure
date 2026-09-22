@@ -40,7 +40,7 @@ import {
   UserEntity,
 } from './entities';
 import { TtsService } from './tts.service';
-import { AsrService } from './asr.service';
+import { AsrService, RealtimeAsrResult } from './asr.service';
 import { AiChatService } from './ai-chat.service';
 import { AlarmSoundService } from './alarm-sound.service';
 import { SpeechChunker } from './speech-chunker';
@@ -51,6 +51,29 @@ interface ConversationSpeechTurn {
   source: string;
   cancelled: boolean;
 }
+
+export type DeviceRealtimeReplyEvent =
+  | { type: 'reply.started'; conversationTurnId: string }
+  | { type: 'reply.text.delta'; delta: string }
+  | {
+      type: 'reply.audio';
+      commandId: string;
+      conversationTurnId: string;
+      sequence: number;
+      text: string;
+      audioPath: string;
+      audioFormat: string;
+      sampleRate: number;
+    }
+  | {
+      type: 'reply.completed';
+      conversationTurnId: string;
+      assistantMessageId: string;
+      chunkCount: number;
+    }
+  | { type: 'reply.error'; message: string };
+
+type DeviceRealtimeReplyEmitter = (event: DeviceRealtimeReplyEvent) => void;
 
 @Injectable()
 export class StoreService implements OnModuleInit, OnModuleDestroy {
@@ -333,7 +356,9 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     return this.enqueueCommand(device.id, 'start_listening', {
       durationMs: 10000,
       sampleRate: 16000,
-      format: 'wav',
+      format: 'pcm_s16le',
+      transport: 'websocket',
+      fallbackTransport: 'wav_http',
       source: 'app',
       stopMode: 'vad',
     });
@@ -694,6 +719,7 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     assistantMessageId: string | null,
     userMessageId: string,
     aiModel: string,
+    emitReply?: DeviceRealtimeReplyEmitter,
   ) {
     if (!this.isConversationSpeechTurnActive(device.id, turn)) return;
     try {
@@ -758,6 +784,16 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
           },
         }),
       );
+      this.emitDeviceRealtimeReply(emitReply, {
+        type: 'reply.audio',
+        commandId: command.id,
+        conversationTurnId: turn.id,
+        sequence,
+        text,
+        audioPath: speech.audioPath,
+        audioFormat: speech.format,
+        sampleRate: speech.sampleRate,
+      });
       this.logger.log(
         `App conversation speech chunk queued device=${device.id} turn=${turn.id} sequence=${sequence}`,
       );
@@ -800,6 +836,7 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     turn: ConversationSpeechTurn,
     assistantMessageId: string,
     chunkCount: number,
+    emitReply?: DeviceRealtimeReplyEmitter,
   ) {
     if (!this.isConversationSpeechTurnActive(deviceId, turn)) return;
     this.conversationSpeechTurns.delete(deviceId);
@@ -816,6 +853,28 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
         },
       }),
     );
+    this.emitDeviceRealtimeReply(emitReply, {
+      type: 'reply.completed',
+      conversationTurnId: turn.id,
+      assistantMessageId,
+      chunkCount,
+    });
+  }
+
+  private emitDeviceRealtimeReply(
+    emitReply: DeviceRealtimeReplyEmitter | undefined,
+    event: DeviceRealtimeReplyEvent,
+  ) {
+    if (!emitReply) return;
+    try {
+      emitReply(event);
+    } catch (error) {
+      this.logger.warn(
+        `Unable to emit realtime reply event type=${event.type}: ${
+          error instanceof Error ? error.message : 'unknown error'
+        }`,
+      );
+    }
   }
 
   private async failAppConversationSpeech(
@@ -823,6 +882,7 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     turn: ConversationSpeechTurn,
     assistantMessageId: string,
     error: unknown,
+    emitReply?: DeviceRealtimeReplyEmitter,
   ) {
     if (this.conversationSpeechTurns.get(deviceId) === turn) {
       this.conversationSpeechTurns.delete(deviceId);
@@ -831,6 +891,10 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     this.logger.warn(
       `Conversation speech pipeline failed device=${deviceId} turn=${turn.id}: ${message}`,
     );
+    this.emitDeviceRealtimeReply(emitReply, {
+      type: 'reply.error',
+      message,
+    });
     await this.eventRepository
       .save(
         this.eventRepository.create({
@@ -1102,6 +1166,24 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     command.acknowledgedAt = new Date();
     await this.commandRepository.save(command);
     return { acknowledged: true };
+  }
+
+  async interruptDeviceConversation(
+    device: DeviceEntity,
+    reason = 'device_barge_in',
+  ) {
+    const cancellation = await this.cancelPendingConversationSpeech(
+      device.id,
+      reason,
+    );
+    await this.eventRepository.save(
+      this.eventRepository.create({
+        deviceId: device.id,
+        type: 'conversation_interrupted',
+        payload: { reason, ...cancellation },
+      }),
+    );
+    return cancellation;
   }
 
   private async expireStaleAlarmCommands(device: DeviceEntity) {
@@ -1396,6 +1478,96 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
+  async receiveDevicePcmStream(
+    device: DeviceEntity,
+    commandId: string | undefined,
+    pcm: Buffer,
+    emitReply?: DeviceRealtimeReplyEmitter,
+  ) {
+    const recognition = await this.asr.recognizePcm16(pcm);
+    return this.receiveDevicePcmRecognition(
+      device,
+      commandId,
+      recognition,
+      'websocket_pcm_batch_fallback',
+      emitReply,
+    );
+  }
+
+  async receiveDeviceRealtimeRecognition(
+    device: DeviceEntity,
+    commandId: string | undefined,
+    recognition: RealtimeAsrResult,
+    emitReply?: DeviceRealtimeReplyEmitter,
+  ) {
+    return this.receiveDevicePcmRecognition(
+      device,
+      commandId,
+      recognition,
+      'websocket_pcm_realtime',
+      emitReply,
+    );
+  }
+
+  private async receiveDevicePcmRecognition(
+    device: DeviceEntity,
+    commandId: string | undefined,
+    recognition: Awaited<ReturnType<AsrService['recognizePcm16']>> | RealtimeAsrResult,
+    transport: 'websocket_pcm_realtime' | 'websocket_pcm_batch_fallback',
+    emitReply?: DeviceRealtimeReplyEmitter,
+  ) {
+    const normalizedCommandId = commandId?.trim() || null;
+    if (normalizedCommandId) {
+      const command = await this.commandRepository.findOne({
+        where: {
+          id: normalizedCommandId,
+          deviceId: device.id,
+          type: 'start_listening',
+        },
+      });
+      if (!command) {
+        throw new NotFoundException('录音指令不存在或不属于该设备');
+      }
+    }
+
+    device.lastSeenAt = new Date();
+    const source = normalizedCommandId
+      ? 'app_voice_websocket'
+      : 'device_button_voice_websocket';
+    const event = this.eventRepository.create({
+      deviceId: device.id,
+      type: recognition.text ? 'speech_recognized' : 'speech_empty',
+      payload: {
+        commandId: normalizedCommandId,
+        source,
+        transport,
+        text: recognition.text,
+        provider: recognition.provider,
+        taskId: recognition.taskId,
+        durationMs: recognition.durationMs,
+        sampleRate: recognition.sampleRate,
+        firstPartialMs:
+          'firstPartialMs' in recognition ? recognition.firstPartialMs : null,
+        recognitionElapsedMs:
+          'recognitionElapsedMs' in recognition
+            ? recognition.recognitionElapsedMs
+            : null,
+      },
+    });
+    await Promise.all([
+      this.deviceRepository.save(device),
+      this.eventRepository.save(event),
+    ]);
+    if (recognition.text) {
+      this.queueConversation(device.id, recognition.text, source, emitReply);
+    }
+    return {
+      accepted: true,
+      commandId: normalizedCommandId,
+      ...recognition,
+    };
+  }
+
   async replyToDeviceMessage(device: DeviceEntity, dto: DeviceMessageDto) {
     device.lastSeenAt = new Date();
     await this.deviceRepository.save(device);
@@ -1414,14 +1586,29 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  private queueConversation(deviceId: string, text: string, source: string) {
+  private queueConversation(
+    deviceId: string,
+    text: string,
+    source: string,
+    emitReply?: DeviceRealtimeReplyEmitter,
+  ) {
     const previous = this.conversationChains.get(deviceId) ?? Promise.resolve();
     const next = previous
       .catch(() => undefined)
       .then(async () => {
         try {
-          await this.createConversationReply(deviceId, text, source);
+          await this.createStreamingConversationReply(
+            deviceId,
+            text,
+            source,
+            emitReply,
+          );
         } catch (error) {
+          this.emitDeviceRealtimeReply(emitReply, {
+            type: 'reply.error',
+            message:
+              error instanceof Error ? error.message : 'AI 对话处理失败',
+          });
           this.logger.error(
             `Conversation failed device=${deviceId}: ${
               error instanceof Error ? error.message : 'unknown error'
@@ -1446,6 +1633,151 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
         }
       });
     this.conversationChains.set(deviceId, next);
+  }
+
+  private async createStreamingConversationReply(
+    deviceId: string,
+    text: string,
+    source: string,
+    emitReply?: DeviceRealtimeReplyEmitter,
+  ) {
+    const device = await this.deviceRepository.findOne({ where: { id: deviceId } });
+    if (!device?.ownerUserId) throw new BadRequestException('设备尚未绑定用户');
+    if (!device.characterId) throw new BadRequestException('设备尚未绑定角色');
+    const character = await this.requireCharacter(device.characterId);
+    const userMessage = await this.conversationRepository.save(
+      this.conversationRepository.create({
+        userId: device.ownerUserId,
+        deviceId: device.id,
+        characterId: character.id,
+        role: 'user',
+        content: text,
+        source,
+      }),
+    );
+    const recentMessages = await this.conversationRepository.find({
+      where: {
+        userId: device.ownerUserId,
+        deviceId: device.id,
+        characterId: character.id,
+      },
+      order: { createdAt: 'DESC' },
+      take: 30,
+    });
+    recentMessages.reverse();
+    const prompt =
+      character.prompt?.trim() ||
+      `你是${character.name}。${character.description}请始终以这个角色的身份，用自然、简短、适合语音播放的中文回答。`;
+    const speechTurn = await this.beginAppConversationSpeech(
+      device,
+      character,
+      source,
+      userMessage.id,
+    );
+    if (speechTurn) {
+      this.emitDeviceRealtimeReply(emitReply, {
+        type: 'reply.started',
+        conversationTurnId: speechTurn.id,
+      });
+    }
+    const chunker = speechTurn ? new SpeechChunker() : null;
+    let sequence = 0;
+    let assistantMessageId: string | null = null;
+    let aiModel = process.env.AI_MODEL?.trim() || 'MiniMax-M2.7';
+    let speechChain = Promise.resolve();
+    const queueChunks = (chunks: string[]) => {
+      if (!speechTurn) return;
+      for (const chunk of chunks) {
+        const spokenText = this.tts.normalizeForSpeech(chunk);
+        if (!spokenText) continue;
+        const currentSequence = sequence++;
+        speechChain = speechChain.then(() =>
+          this.prepareAppConversationSpeechChunk(
+            device,
+            character,
+            speechTurn,
+            spokenText,
+            currentSequence,
+            assistantMessageId,
+            userMessage.id,
+            aiModel,
+            emitReply,
+          ),
+        );
+      }
+    };
+
+    let reply: Awaited<ReturnType<AiChatService['stream']>>;
+    try {
+      reply = await this.aiChat.stream(
+        prompt,
+        recentMessages.map((message) => ({
+          role: message.role,
+          content: message.content,
+        })),
+        (delta) => {
+          this.emitDeviceRealtimeReply(emitReply, {
+            type: 'reply.text.delta',
+            delta,
+          });
+          if (chunker) queueChunks(chunker.push(delta));
+        },
+      );
+    } catch (error) {
+      if (speechTurn) {
+        await this.cancelPendingConversationSpeech(device.id, 'stream_failed');
+      }
+      throw error;
+    }
+    aiModel = reply.model;
+    if (chunker) queueChunks(chunker.flush());
+    const assistantMessage = await this.conversationRepository.save(
+      this.conversationRepository.create({
+        userId: device.ownerUserId,
+        deviceId: device.id,
+        characterId: character.id,
+        role: 'assistant',
+        content: reply.content,
+        source,
+      }),
+    );
+    assistantMessageId = assistantMessage.id;
+    if (speechTurn) {
+      void speechChain
+        .then(() =>
+          this.finishAppConversationSpeech(
+            device.id,
+            speechTurn,
+            assistantMessage.id,
+            sequence,
+            emitReply,
+          ),
+        )
+        .catch((error) =>
+          this.failAppConversationSpeech(
+            device.id,
+            speechTurn,
+            assistantMessage.id,
+            error,
+            emitReply,
+          ),
+        );
+    }
+    await this.eventRepository.save(
+      this.eventRepository.create({
+        deviceId: device.id,
+        type: 'conversation_reply_ready',
+        payload: {
+          source,
+          userMessageId: userMessage.id,
+          assistantMessageId: assistantMessage.id,
+          text: reply.content,
+          model: reply.model,
+          chunkCount: sequence,
+          transport: 'streaming_tts',
+        },
+      }),
+    );
   }
 
   private async createConversationReply(

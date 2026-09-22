@@ -15,6 +15,7 @@ import { AiChatService } from './ai-chat.service';
 import { AlarmsController } from './alarms.controller';
 import { AlarmSoundsController } from './alarm-sounds.controller';
 import { AlarmSoundService } from './alarm-sound.service';
+import { VoiceRecognitionHub } from './voice-recognition-hub';
 
 @Module({
   imports: [TypeOrmModule.forFeature(databaseEntities)],
@@ -34,6 +35,7 @@ import { AlarmSoundService } from './alarm-sound.service';
     AsrService,
     AiChatService,
     AlarmSoundService,
+    VoiceRecognitionHub,
     UserAuthGuard,
     DeviceAuthGuard,
   ],

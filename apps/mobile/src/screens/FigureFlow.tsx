@@ -33,6 +33,7 @@ import {
   isConversationStreamCancelled,
   normalizeApiBaseUrl,
   saveApiBaseUrl,
+  subscribeDeviceVoiceRecognition,
 } from '../api';
 import { palette } from '../theme';
 import { AlarmFlow } from './AlarmFlow';
@@ -501,6 +502,10 @@ function ConversationHistoryScreen({
   const [sendError, setSendError] = useState('');
   const [failedRequest, setFailedRequest] = useState<FailedConversationRequest | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const [voiceRecognition, setVoiceRecognition] = useState<{
+    phase: 'listening' | 'recognizing' | 'final' | 'error';
+    text: string;
+  } | null>(null);
   const [hasOlder, setHasOlder] = useState(
     messages.filter((message) => !characterId || message.characterId === characterId).length >=
       CONVERSATION_PAGE_SIZE,
@@ -512,15 +517,56 @@ function ConversationHistoryScreen({
   const loadingOlderRef = useRef(false);
   const streamAbortRef = useRef<AbortController | null>(null);
   const activeStreamRef = useRef<FailedConversationRequest | null>(null);
+  const voiceClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(
     () => () => {
       activeStreamRef.current = null;
       streamAbortRef.current?.abort();
       streamAbortRef.current = null;
+      if (voiceClearTimerRef.current) clearTimeout(voiceClearTimerRef.current);
     },
     [],
   );
+
+  useEffect(() => {
+    if (!device?.id || !token) return undefined;
+    const stop = subscribeDeviceVoiceRecognition(token, device.id, (event) => {
+      if (voiceClearTimerRef.current) {
+        clearTimeout(voiceClearTimerRef.current);
+        voiceClearTimerRef.current = null;
+      }
+      stickToBottomRef.current = true;
+      if (event.type === 'voice.listening') {
+        setVoiceRecognition({ phase: 'listening', text: '正在聆听…' });
+      } else if (
+        event.type === 'voice.transcript.partial' ||
+        event.type === 'voice.transcript.sentence'
+      ) {
+        setVoiceRecognition({ phase: 'recognizing', text: event.text });
+      } else if (event.type === 'voice.transcript.final') {
+        setVoiceRecognition({
+          phase: 'final',
+          text: event.text || '没有听清，请再说一次',
+        });
+        voiceClearTimerRef.current = setTimeout(
+          () => setVoiceRecognition(null),
+          5000,
+        );
+      } else if (event.type === 'voice.error') {
+        setVoiceRecognition({ phase: 'error', text: event.message });
+        voiceClearTimerRef.current = setTimeout(
+          () => setVoiceRecognition(null),
+          3500,
+        );
+      }
+    });
+    return () => {
+      stop();
+      if (voiceClearTimerRef.current) clearTimeout(voiceClearTimerRef.current);
+      voiceClearTimerRef.current = null;
+    };
+  }, [device?.id, token]);
 
   useEffect(() => {
     const currentCharacterMessages = characterId
@@ -580,7 +626,7 @@ function ConversationHistoryScreen({
 
   useEffect(() => {
     if (stickToBottomRef.current) scrollToLatest(initialScrollDoneRef.current);
-  }, [latestMessageContent, visibleMessages.length]);
+  }, [latestMessageContent, visibleMessages.length, voiceRecognition?.text]);
 
   const loadOlderMessages = async () => {
     if (
@@ -847,6 +893,38 @@ function ConversationHistoryScreen({
               <Text style={styles.centerMuted}>在下面输入文字，就可以开始和角色聊天。</Text>
             </View>
           )}
+          {voiceRecognition ? (
+            <View
+              style={[
+                styles.voiceRecognitionCard,
+                voiceRecognition.phase === 'error' &&
+                  styles.voiceRecognitionCardError,
+              ]}
+            >
+              {voiceRecognition.phase === 'listening' ||
+              voiceRecognition.phase === 'recognizing' ? (
+                <ActivityIndicator size="small" color="#FFFFFF" />
+              ) : (
+                <Text style={styles.voiceRecognitionIcon}>
+                  {voiceRecognition.phase === 'error' ? '!' : '✓'}
+                </Text>
+              )}
+              <View style={styles.flex}>
+                <Text style={styles.voiceRecognitionLabel}>
+                  {voiceRecognition.phase === 'listening'
+                    ? '底座正在聆听'
+                    : voiceRecognition.phase === 'recognizing'
+                      ? '正在识别'
+                      : voiceRecognition.phase === 'final'
+                        ? '已识别'
+                        : '语音识别异常'}
+                </Text>
+                <Text style={styles.voiceRecognitionText}>
+                  {voiceRecognition.text}
+                </Text>
+              </View>
+            </View>
+          ) : null}
           <Text style={styles.historyHint}>长按对话气泡可进行更多操作</Text>
         </ScrollView>
         {selecting ? (
@@ -1623,6 +1701,11 @@ const styles = StyleSheet.create({
   historyOlderLoadingText: { color: '#888888', fontSize: 12 },
   historyTime: { color: '#888888', fontSize: 15, textAlign: 'center', marginBottom: 24, marginTop: 8 },
   historyHint: { color: '#D0D0D0', fontSize: 16, textAlign: 'center', marginTop: 38 },
+  voiceRecognitionCard: { alignSelf: 'flex-end', width: '78%', minHeight: 72, borderRadius: 22, borderBottomRightRadius: 4, backgroundColor: '#222222', paddingHorizontal: 16, paddingVertical: 12, flexDirection: 'row', alignItems: 'center', gap: 11, marginTop: 4, marginBottom: 4 },
+  voiceRecognitionCardError: { backgroundColor: '#B44842' },
+  voiceRecognitionIcon: { width: 20, color: '#FFFFFF', fontSize: 18, lineHeight: 22, fontWeight: '900', textAlign: 'center' },
+  voiceRecognitionLabel: { color: '#B8D16E', fontSize: 11, lineHeight: 16, fontWeight: '800' },
+  voiceRecognitionText: { color: '#FFFFFF', fontSize: 16, lineHeight: 23, marginTop: 2 },
   historyEmpty: { minHeight: 360, alignItems: 'center', justifyContent: 'center', gap: 8 },
   messageLine: { flexDirection: 'row', alignItems: 'center', marginBottom: 32 },
   messageLineMine: { justifyContent: 'flex-end' },

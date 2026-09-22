@@ -71,6 +71,24 @@ export type ConversationStreamEvent =
     }
   | { type: 'error'; message: string };
 
+export type DeviceVoiceEvent =
+  | { type: 'voice.listening'; deviceId: string }
+  | {
+      type: 'voice.transcript.partial' | 'voice.transcript.sentence';
+      deviceId: string;
+      text: string;
+      elapsedMs: number;
+    }
+  | {
+      type: 'voice.transcript.final';
+      deviceId: string;
+      text: string;
+      durationMs: number;
+      firstPartialMs: number | null;
+      asrMode: 'realtime' | 'batch_fallback';
+    }
+  | { type: 'voice.error'; deviceId?: string; message: string };
+
 export function getApiBaseUrl() {
   return API_BASE_URL;
 }
@@ -142,6 +160,60 @@ function conversationWebSocketUrl() {
   url.search = '';
   url.hash = '';
   return url.toString();
+}
+
+function voiceEventsWebSocketUrl() {
+  const url = new URL(API_BASE_URL);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.pathname = '/v1/devices/voice/events';
+  url.search = '';
+  url.hash = '';
+  return url.toString();
+}
+
+export function subscribeDeviceVoiceRecognition(
+  token: string,
+  deviceId: string,
+  onEvent: (event: DeviceVoiceEvent) => void,
+) {
+  let stopped = false;
+  let socket: WebSocket | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const connect = () => {
+    if (stopped) return;
+    socket = new WebSocket(voiceEventsWebSocketUrl());
+    socket.onopen = () => {
+      socket?.send(
+        JSON.stringify({ type: 'voice.subscribe', token, deviceId }),
+      );
+    };
+    socket.onmessage = (message) => {
+      try {
+        const event = JSON.parse(String(message.data)) as
+          | DeviceVoiceEvent
+          | { type: 'voice.subscribed'; deviceId: string };
+        if (event.type !== 'voice.subscribed') onEvent(event);
+      } catch {
+        onEvent({ type: 'voice.error', message: '实时识别状态无法解析' });
+      }
+    };
+    socket.onclose = () => {
+      socket = null;
+      if (!stopped) reconnectTimer = setTimeout(connect, 2000);
+    };
+    socket.onerror = () => {
+      // onclose performs a quiet reconnect; normal history loading still works.
+    };
+  };
+
+  connect();
+  return () => {
+    stopped = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    socket?.close();
+    socket = null;
+  };
 }
 
 function streamConversationMessageOverWebSocket(
