@@ -1,5 +1,6 @@
 去这里在线生成：https://mermaid.live/
 把下面的copy过去
+或者中文版的可以在线生成管理https://diagrama.cn
 
 
 sequenceDiagram
