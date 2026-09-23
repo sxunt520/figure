@@ -54,8 +54,10 @@ CosyVoice TTS 使用阿里云百炼 API Key：
 
 ```dotenv
 DASHSCOPE_API_KEY=你的百炼_API_Key
-DASHSCOPE_TTS_MODEL=cosyvoice-v3-flash
-DASHSCOPE_TTS_DEFAULT_VOICE=longanyang
+DASHSCOPE_TTS_MODEL=cosyvoice-v3.5-plus
+DASHSCOPE_TTS_WS_ENDPOINT=wss://dashscope.aliyuncs.com/api-ws/v1/inference
+DASHSCOPE_TTS_REALTIME_ENABLED=true
+DASHSCOPE_TTS_DEFAULT_VOICE=<已复刻的 CosyVoice v3.5 音色 ID>
 ```
 
 语音识别使用 `ALIYUN_ACCESS_KEY_ID`、`ALIYUN_ACCESS_KEY_SECRET` 和
@@ -161,7 +163,7 @@ npx expo export --platform ios --output-dir /tmp/figure-expo-export
 2. 将 `figure_users` 演示用户映射替换为现有 APP 用户表和正式登录 Token。
 3. 实体按键到货后，将常开按键接在 `GPIO39` 与 `GND` 之间；固件接口已经就绪。
 4. 将临时门禁卡替换为手办内置 NTAG213；现有 RC522 UID 识别、角色绑定和自动切换链路可直接复用。
-5. 当前设备语音已使用持久 WebSocket + PCM16 实时识别；底座上线后预连接，单条连接可承载多轮对话。识别完成后，同一连接会直接推送分段文本与 TTS 音频，首个自然短语会优先合成，底座收到首段即可播放，并支持再次按下对话键打断当前回复。HTTP WAV、设备指令轮询仍作为稳定降级链路；后续可继续升级为 Opus 编码和真正的全双工语音。
+5. 当前设备语音使用持久 WebSocket，并优先通过 Opus 16 kHz 单声道、20 ms 帧上传；连接建立时由后端广播能力，后端或编码器不支持 Opus 时自动回退 PCM16。后端验证设备后立即允许开始录音，阿里云实时 ASR 在后台并行建连，启动期间的音频会缓存后补送；说话结束后仍未就绪则快速转批量识别。单条连接可承载多轮对话，识别完成后会直接推送分段文本与 TTS 音频，首个自然短语优先合成，底座收到首段即可播放，并支持再次按下对话键打断当前回复。HTTP WAV、设备指令轮询仍作为稳定降级链路；后续可继续升级为带回声消除的真正全双工语音。
 
 ## ESP32-S3 主板自检
 
@@ -174,6 +176,7 @@ PSRAM、RGB 灯、ST7789 屏幕、HT517 功放、扬声器和 INMP441 麦克风�
 
 - 演示 Token 和预置设备凭证只用于本地开发。
 - 演示角色中的占位 `voiceId` 会回退到 `DASHSCOPE_TTS_DEFAULT_VOICE`；完成音色复刻后替换成正式音色 ID。
+- 对话 TTS 默认走 DashScope WebSocket 实时合成，完整 WAV 到达后立即交给底座；连接或模型不支持时自动降级到原 HTTP 合成。设置 `DASHSCOPE_TTS_REALTIME_ENABLED=false` 可强制使用 HTTP。
 - 尚未实现 OTA、完整恢复出厂和固件签名；当前二维码仍使用开发阶段共享值，量产前必须改成一机一码。
 - 普通主动提醒仍由运行中的 API 进程触发；AI 闹钟已由 0.8 固件提前缓存 WAV 和计划，
   可在后端临时不可达时本地响铃。APP 会显示底座的真实同步回执，并在响铃时

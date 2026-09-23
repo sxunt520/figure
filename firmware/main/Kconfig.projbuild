@@ -237,7 +237,7 @@ menu "Figure Board Self-Test"
         int "VAD silence duration before stopping"
         depends on FIGURE_ENABLE_MICROPHONE
         range 400 3000
-        default 1000
+        default 600
 
     config FIGURE_VAD_START_TIMEOUT_MS
         int "VAD no-speech timeout"
@@ -249,7 +249,7 @@ menu "Figure Board Self-Test"
         int "VAD minimum recording duration"
         depends on FIGURE_ENABLE_MICROPHONE
         range 500 3000
-        default 1000
+        default 500
 
     config FIGURE_ENABLE_TALK_BUTTON
         bool "Enable active-low talk button interface"

@@ -144,7 +144,7 @@ APP 的设备视图会返回 `nfcTag`：
 ## 6. 上传短语音
 
 APP 通过 `POST /devices/<deviceId>/listen` 下发 `start_listening`。设备进入
-`LISTENING` 后以 VAD 录音：检测到说话后遇到约 1 秒静音自动结束，约 4 秒内没有
+`LISTENING` 后以 VAD 录音：检测到说话后遇到约 0.6 秒静音自动结束，约 4 秒内没有
 说话则结束，最大录音长度由 `durationMs` 限制（当前 APP 为 10 秒）。输出为
 16 kHz、16-bit、单声道 PCM WAV：
 
@@ -199,8 +199,16 @@ GET /devices/<deviceId>/messages
 Authorization: Bearer <appAccessToken>
 ```
 
-实时语音阶段再升级为独立 WebSocket + Opus 流；当前 HTTP 半双工链路保留为
-稳定降级方案。
+实时语音使用独立持久 WebSocket。连接建立后，后端先发送
+`session.capabilities`，当前优先协商 `opus`（16 kHz、单声道、20 ms/帧），并兼容
+`pcm_s16le`。Opus 每个二进制 WebSocket 消息承载一个完整编码帧；后端逐帧解码成
+PCM 后送入现有实时 ASR。编码器或后端不支持 Opus 时自动使用 PCM，HTTP WAV
+半双工链路继续作为稳定降级方案。
+
+后端完成设备身份校验后会立即返回 `session.ready`，不再阻塞等待阿里云
+实时 ASR 建连。ASR 在后台并行启动，建连期间到达的 PCM 会在内存中按序缓存并在
+就绪后补送。说话结束时若实时 ASR 仍未就绪，最多再等待 800 ms，然后直接
+转为批量 ASR，避免云端建连波动拖住整轮对话。
 
 ## 9. BLE 配网与更换 Wi-Fi
 

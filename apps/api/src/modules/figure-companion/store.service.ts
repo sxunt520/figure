@@ -52,6 +52,15 @@ interface ConversationSpeechTurn {
   cancelled: boolean;
 }
 
+const VOICE_REPLY_PROMPT =
+  '这是语音对话。请用自然、简短、完整的句子直接回答；不要为了抢播把一句话拆成几个短句。';
+// Debounce the first unpunctuated fragment instead of starting a one-shot
+// timer on the first model delta. Providers often split a natural sentence
+// like `我在呢，有什么...` immediately before the comma; a short quiet
+// window lets the following clause arrive without adding much latency when
+// the model genuinely pauses.
+const FIRST_SPEECH_FRAGMENT_DELAY_MS = 250;
+
 export type DeviceRealtimeReplyEvent =
   | { type: 'reply.started'; conversationTurnId: string }
   | { type: 'reply.text.delta'; delta: string }
@@ -64,6 +73,27 @@ export type DeviceRealtimeReplyEvent =
       audioPath: string;
       audioFormat: string;
       sampleRate: number;
+      audioData?: Buffer;
+      audioStreamId?: string;
+    }
+  | {
+      type: 'reply.audio.stream.start';
+      streamId: string;
+      conversationTurnId: string;
+      sequence: number;
+      sampleRate: number;
+      channels: 1;
+      format: 'pcm_s16le';
+    }
+  | {
+      type: 'reply.audio.stream.chunk';
+      streamId: string;
+      audioData: Buffer;
+    }
+  | {
+      type: 'reply.audio.stream.end';
+      streamId: string;
+      audioBytes: number;
     }
   | {
       type: 'reply.completed';
@@ -73,7 +103,9 @@ export type DeviceRealtimeReplyEvent =
     }
   | { type: 'reply.error'; message: string };
 
-type DeviceRealtimeReplyEmitter = (event: DeviceRealtimeReplyEvent) => void;
+type DeviceRealtimeReplyEmitter = ((event: DeviceRealtimeReplyEvent) => void) & {
+  supportsPcmStream?: boolean;
+};
 
 @Injectable()
 export class StoreService implements OnModuleInit, OnModuleDestroy {
@@ -556,10 +588,10 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     const recentMessages = await this.conversationRepository.find({
       where: { userId, deviceId, characterId: character.id },
       order: { createdAt: 'DESC' },
-      take: 30,
+      take: 16,
     });
     recentMessages.reverse();
-    const prompt =
+    const basePrompt =
       character.prompt?.trim() ||
       `你是${character.name}。${character.description}请始终以这个角色的身份，用自然、简短的中文回答。`;
     this.logger.debug(
@@ -572,11 +604,22 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       source,
       userMessage.id,
     );
+    const prompt = speechTurn
+      ? `${basePrompt}\n${VOICE_REPLY_PROMPT}`
+      : basePrompt;
     const speechChunker = speechTurn ? new SpeechChunker() : null;
     let speechSequence = 0;
     let assistantMessageId: string | null = null;
     let responseModel = process.env.AI_MODEL?.trim() || 'MiniMax-M2.7';
     let speechChain = Promise.resolve();
+    let firstSpeechFragmentTimer: NodeJS.Timeout | undefined;
+    const conversationStartedAt = Date.now();
+    let firstDeltaLogged = false;
+    const clearFirstSpeechFragmentTimer = () => {
+      if (!firstSpeechFragmentTimer) return;
+      clearTimeout(firstSpeechFragmentTimer);
+      firstSpeechFragmentTimer = undefined;
+    };
     const queueSpeechChunks = (chunks: string[]) => {
       if (!speechTurn) return;
       for (const chunk of chunks) {
@@ -597,6 +640,22 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
           ),
         );
       }
+      if (speechSequence > 0) clearFirstSpeechFragmentTimer();
+    };
+    const scheduleFirstSpeechFragment = () => {
+      if (!speechChunker || speechSequence > 0) return;
+      clearFirstSpeechFragmentTimer();
+      firstSpeechFragmentTimer = setTimeout(() => {
+        firstSpeechFragmentTimer = undefined;
+        if (speechSequence > 0) return;
+        const chunks = speechChunker.takeEarlyFragment();
+        if (chunks.length > 0) {
+          this.logger.debug(
+            `App conversation early speech fragment device=${device.id} chars=${this.tts.normalizeForSpeech(chunks[0]).length} elapsedMs=${Date.now() - conversationStartedAt}`,
+          );
+          queueSpeechChunks(chunks);
+        }
+      }, FIRST_SPEECH_FRAGMENT_DELAY_MS);
     };
 
     let reply: Awaited<ReturnType<AiChatService['stream']>>;
@@ -608,12 +667,22 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
           content: message.content,
         })),
         (delta) => {
+          if (!firstDeltaLogged) {
+            firstDeltaLogged = true;
+            this.logger.log(
+              `App conversation first AI delta device=${device.id} elapsedMs=${Date.now() - conversationStartedAt}`,
+            );
+          }
           emit({ type: 'message.delta', delta });
-          if (speechChunker) queueSpeechChunks(speechChunker.push(delta));
+          if (speechChunker) {
+            queueSpeechChunks(speechChunker.push(delta));
+            scheduleFirstSpeechFragment();
+          }
         },
         signal,
       );
     } catch (error) {
+      clearFirstSpeechFragmentTimer();
       if (speechTurn) {
         await this.cancelPendingConversationSpeech(
           device.id,
@@ -622,6 +691,7 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       }
       throw error;
     }
+    clearFirstSpeechFragmentTimer();
     responseModel = reply.model;
     if (speechChunker) queueSpeechChunks(speechChunker.flush());
     const assistantMessage = await this.conversationRepository.save(
@@ -723,11 +793,52 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
   ) {
     if (!this.isConversationSpeechTurnActive(device.id, turn)) return;
     try {
+      const ttsStartedAt = Date.now();
+      const audioStreamId = emitReply?.supportsPcmStream ? randomUUID() : null;
+      const audioStreamSampleRate = Number(
+        process.env.DASHSCOPE_TTS_SAMPLE_RATE || 24000,
+      );
+      let audioStreamStarted = false;
+      let streamedAudioBytes = 0;
+      this.logger.debug(
+        `App conversation TTS started device=${device.id} turn=${turn.id} sequence=${sequence} chars=${text.length}`,
+      );
       const speech = await this.tts.synthesize(
         text,
         character.voiceId,
         character.ttsModel,
+        audioStreamId
+          ? {
+              onPcmChunk: (chunk) => {
+                if (!audioStreamStarted) {
+                  audioStreamStarted = true;
+                  this.emitDeviceRealtimeReply(emitReply, {
+                    type: 'reply.audio.stream.start',
+                    streamId: audioStreamId,
+                    conversationTurnId: turn.id,
+                    sequence,
+                    sampleRate: audioStreamSampleRate,
+                    channels: 1,
+                    format: 'pcm_s16le',
+                  });
+                }
+                streamedAudioBytes += chunk.length;
+                this.emitDeviceRealtimeReply(emitReply, {
+                  type: 'reply.audio.stream.chunk',
+                  streamId: audioStreamId,
+                  audioData: chunk,
+                });
+              },
+            }
+          : undefined,
       );
+      if (audioStreamStarted && audioStreamId) {
+        this.emitDeviceRealtimeReply(emitReply, {
+          type: 'reply.audio.stream.end',
+          streamId: audioStreamId,
+          audioBytes: streamedAudioBytes,
+        });
+      }
       if (!this.isConversationSpeechTurnActive(device.id, turn)) return;
       const currentDevice = await this.deviceRepository.findOne({
         where: { id: device.id },
@@ -793,9 +904,11 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
         audioPath: speech.audioPath,
         audioFormat: speech.format,
         sampleRate: speech.sampleRate,
+        audioData: audioStreamStarted ? undefined : speech.audio,
+        audioStreamId: audioStreamStarted ? audioStreamId ?? undefined : undefined,
       });
       this.logger.log(
-        `App conversation speech chunk queued device=${device.id} turn=${turn.id} sequence=${sequence}`,
+        `App conversation speech chunk queued device=${device.id} turn=${turn.id} sequence=${sequence} chars=${text.length} ttsMs=${Date.now() - ttsStartedAt}`,
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown error';
@@ -1662,10 +1775,10 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
         characterId: character.id,
       },
       order: { createdAt: 'DESC' },
-      take: 30,
+      take: 16,
     });
     recentMessages.reverse();
-    const prompt =
+    const basePrompt =
       character.prompt?.trim() ||
       `你是${character.name}。${character.description}请始终以这个角色的身份，用自然、简短、适合语音播放的中文回答。`;
     const speechTurn = await this.beginAppConversationSpeech(
@@ -1680,11 +1793,22 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
         conversationTurnId: speechTurn.id,
       });
     }
+    const prompt = speechTurn
+      ? `${basePrompt}\n${VOICE_REPLY_PROMPT}`
+      : basePrompt;
     const chunker = speechTurn ? new SpeechChunker() : null;
     let sequence = 0;
     let assistantMessageId: string | null = null;
     let aiModel = process.env.AI_MODEL?.trim() || 'MiniMax-M2.7';
     let speechChain = Promise.resolve();
+    let firstSpeechFragmentTimer: NodeJS.Timeout | undefined;
+    const conversationStartedAt = Date.now();
+    let firstDeltaLogged = false;
+    const clearFirstSpeechFragmentTimer = () => {
+      if (!firstSpeechFragmentTimer) return;
+      clearTimeout(firstSpeechFragmentTimer);
+      firstSpeechFragmentTimer = undefined;
+    };
     const queueChunks = (chunks: string[]) => {
       if (!speechTurn) return;
       for (const chunk of chunks) {
@@ -1705,6 +1829,22 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
           ),
         );
       }
+      if (sequence > 0) clearFirstSpeechFragmentTimer();
+    };
+    const scheduleFirstSpeechFragment = () => {
+      if (!chunker || sequence > 0) return;
+      clearFirstSpeechFragmentTimer();
+      firstSpeechFragmentTimer = setTimeout(() => {
+        firstSpeechFragmentTimer = undefined;
+        if (sequence > 0) return;
+        const chunks = chunker.takeEarlyFragment();
+        if (chunks.length > 0) {
+          this.logger.debug(
+            `Device conversation early speech fragment device=${device.id} chars=${this.tts.normalizeForSpeech(chunks[0]).length} elapsedMs=${Date.now() - conversationStartedAt}`,
+          );
+          queueChunks(chunks);
+        }
+      }, FIRST_SPEECH_FRAGMENT_DELAY_MS);
     };
 
     let reply: Awaited<ReturnType<AiChatService['stream']>>;
@@ -1716,19 +1856,30 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
           content: message.content,
         })),
         (delta) => {
+          if (!firstDeltaLogged) {
+            firstDeltaLogged = true;
+            this.logger.log(
+              `Device conversation first AI delta device=${device.id} elapsedMs=${Date.now() - conversationStartedAt}`,
+            );
+          }
           this.emitDeviceRealtimeReply(emitReply, {
             type: 'reply.text.delta',
             delta,
           });
-          if (chunker) queueChunks(chunker.push(delta));
+          if (chunker) {
+            queueChunks(chunker.push(delta));
+            scheduleFirstSpeechFragment();
+          }
         },
       );
     } catch (error) {
+      clearFirstSpeechFragmentTimer();
       if (speechTurn) {
         await this.cancelPendingConversationSpeech(device.id, 'stream_failed');
       }
       throw error;
     }
+    clearFirstSpeechFragmentTimer();
     aiModel = reply.model;
     if (chunker) queueChunks(chunker.flush());
     const assistantMessage = await this.conversationRepository.save(

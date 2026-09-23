@@ -34,6 +34,7 @@ const MAX_OPUS_PACKET_BYTES = 1275;
 const RECORDING_IDLE_TIMEOUT_MS = 15_000;
 const CONNECTION_IDLE_TIMEOUT_MS = 10 * 60_000;
 const REPLY_TIMEOUT_MS = 120_000;
+const REALTIME_ASR_FINISH_GRACE_MS = 800;
 
 function isDeviceVoiceUpgrade(request: IncomingMessage) {
   try {
@@ -120,11 +121,15 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
     let receivedWireBytes = 0;
     let finishing = false;
     let realtimeAsr: RealtimeAsrSession | null = null;
+    let realtimeAsrPromise: Promise<RealtimeAsrSession | null> | null = null;
+    let discardPendingRealtimeAsr = false;
     let opusDecoder: OpusDecoder | null = null;
     let realtimeFallbackReason: string | null = null;
     let idleTimer: NodeJS.Timeout | undefined;
     let replyTimer: NodeJS.Timeout | undefined;
     let speechEndedAt: number | null = null;
+    let turnStartedAt: number | null = null;
+    let firstAudioAt: number | null = null;
     let turnSerial = 0;
 
     const emit = (event: Record<string, unknown>) => {
@@ -164,18 +169,45 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
       receivedPcmBytes = 0;
       receivedWireBytes = 0;
       finishing = false;
+      discardPendingRealtimeAsr = true;
       realtimeAsr = null;
+      realtimeAsrPromise = null;
       opusDecoder = null;
       realtimeFallbackReason = null;
       speechEndedAt = null;
+      turnStartedAt = null;
+      firstAudioAt = null;
       resetIdleTimer(CONNECTION_IDLE_TIMEOUT_MS);
     };
     const createRealtimeReplyEmitter = (serial: number) => {
-      return (event: DeviceRealtimeReplyEvent) => {
+      const emitter = (event: DeviceRealtimeReplyEvent) => {
         if (serial !== turnSerial || !finishing) return;
         const elapsedMs =
           speechEndedAt === null ? null : Date.now() - speechEndedAt;
-        emit({ ...event, elapsedMsSinceSpeechEnd: elapsedMs });
+        if (event.type === 'reply.audio.stream.chunk') {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(event.audioData, { binary: true });
+          }
+        } else if (event.type === 'reply.audio' && event.audioData) {
+          const { audioData, ...wireEvent } = event;
+          emit({
+            ...wireEvent,
+            audioTransport: 'websocket',
+            audioBytes: audioData.length,
+            elapsedMsSinceSpeechEnd: elapsedMs,
+          });
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(audioData, { binary: true });
+          }
+        } else {
+          emit({
+            ...event,
+            ...(event.type === 'reply.audio' && event.audioStreamId
+              ? { audioTransport: 'streamed_pcm' }
+              : {}),
+            elapsedMsSinceSpeechEnd: elapsedMs,
+          });
+        }
         resetReplyTimer();
         if (event.type === 'reply.audio') {
           logger.log(
@@ -187,6 +219,8 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
           );
         }
       };
+      emitter.supportsPcmStream = true;
+      return emitter;
     };
 
     resetIdleTimer(CONNECTION_IDLE_TIMEOUT_MS);
@@ -203,6 +237,7 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
     socket.once('close', () => {
       if (idleTimer) clearTimeout(idleTimer);
       if (replyTimer) clearTimeout(replyTimer);
+      discardPendingRealtimeAsr = true;
       if (!finishing) realtimeAsr?.abort();
       chunks = [];
     });
@@ -264,7 +299,10 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
         if (!request) {
           if (isBinary) throw new Error('请先发送 audio.start');
           request = readStart(data, OpusDecoderClass !== null);
-          const authenticatedDevice = await store.getDeviceForToken(request.token);
+          turnStartedAt = Date.now();
+          const authenticatedDevice = await store.getDeviceForToken(
+            request.token,
+          );
           if (!authenticatedDevice) {
             throw new Error('设备登录状态无效，请重新创建会话');
           }
@@ -274,15 +312,20 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
           receivedPcmBytes = 0;
           receivedWireBytes = 0;
           finishing = false;
+          discardPendingRealtimeAsr = false;
           realtimeFallbackReason = null;
           speechEndedAt = null;
+          firstAudioAt = null;
           opusDecoder =
             request.format === 'opus' && OpusDecoderClass
               ? new OpusDecoderClass(request.sampleRate, request.channels)
               : null;
           voiceHub.publish({ type: 'voice.listening', deviceId: device.id });
-          try {
-            realtimeAsr = await asr.startRealtimeRecognition((progress) => {
+          const activeTurnSerial = turnSerial;
+          const asrStartedAt = Date.now();
+          realtimeAsrPromise = asr
+            .startRealtimeRecognition((progress) => {
+              if (activeTurnSerial !== turnSerial) return;
               if (device) {
                 voiceHub.publish({
                   type: progress.final
@@ -302,24 +345,42 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
                 audioTimeMs: progress.audioTimeMs,
                 elapsedMs: progress.elapsedMs,
               });
+            })
+            .then((session) => {
+              if (
+                discardPendingRealtimeAsr ||
+                activeTurnSerial !== turnSerial ||
+                request === null
+              ) {
+                session.abort();
+                return null;
+              }
+              realtimeAsr = session;
+              for (const chunk of chunks) session.write(chunk);
+              logger.log(
+                `Realtime ASR ready device=${device?.id ?? 'unknown'} turn=${activeTurnSerial} startupMs=${Date.now() - asrStartedAt} bufferedPcmBytes=${receivedPcmBytes}`,
+              );
+              return session;
+            })
+            .catch((error) => {
+              if (activeTurnSerial !== turnSerial) return null;
+              realtimeFallbackReason =
+                error instanceof Error ? error.message : '实时识别连接失败';
+              logger.warn(
+                `Realtime ASR unavailable device=${device?.id ?? 'unknown'} turn=${activeTurnSerial}; using batch fallback: ${realtimeFallbackReason}`,
+              );
+              return null;
             });
-          } catch (error) {
-            realtimeFallbackReason =
-              error instanceof Error ? error.message : '实时识别连接失败';
-            logger.warn(
-              `Realtime ASR unavailable device=${device.id}; using batch fallback: ${realtimeFallbackReason}`,
-            );
-          }
           emit({
             type: 'session.ready',
             format: request.format,
             sampleRate: request.sampleRate,
             channels: request.channels,
             maxDurationMs: 10_000,
-            asrMode: realtimeAsr ? 'realtime' : 'batch_fallback',
+            asrMode: 'realtime_starting',
           });
           logger.log(
-            `Device voice stream started device=${device.id} turn=${turnSerial}`,
+            `Device voice stream ready device=${device.id} turn=${turnSerial} readyMs=${Date.now() - turnStartedAt}`,
           );
           return;
         }
@@ -354,6 +415,12 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
           if (receivedPcmBytes + pcmChunk.length > MAX_PCM_BYTES) {
             throw new Error('录音超过 10 秒上限');
           }
+          if (firstAudioAt === null) {
+            firstAudioAt = Date.now();
+            logger.log(
+              `Device first audio device=${device?.id ?? 'unknown'} turn=${turnSerial} elapsedMs=${turnStartedAt === null ? 'n/a' : firstAudioAt - turnStartedAt}`,
+            );
+          }
           chunks.push(Buffer.from(pcmChunk));
           receivedPcmBytes += pcmChunk.length;
           realtimeAsr?.write(pcmChunk);
@@ -378,7 +445,6 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
         speechEndedAt = Date.now();
         if (idleTimer) clearTimeout(idleTimer);
         const pcm = Buffer.concat(chunks, receivedPcmBytes);
-        chunks = [];
         emit({
           type: 'audio.received',
           format: request.format,
@@ -390,9 +456,24 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
               : 1,
         });
         let result: Awaited<ReturnType<StoreService['receiveDevicePcmStream']>>;
-        if (realtimeAsr) {
+        let activeRealtimeAsr = realtimeAsr;
+        if (!activeRealtimeAsr && realtimeAsrPromise) {
+          activeRealtimeAsr = await Promise.race([
+            realtimeAsrPromise,
+            new Promise<null>((resolve) =>
+              setTimeout(() => resolve(null), REALTIME_ASR_FINISH_GRACE_MS),
+            ),
+          ]);
+        }
+        if (!activeRealtimeAsr && realtimeAsrPromise) {
+          discardPendingRealtimeAsr = true;
+          realtimeFallbackReason ??=
+            `实时识别在说话结束后 ${REALTIME_ASR_FINISH_GRACE_MS}ms 内尚未就绪`;
+        }
+        chunks = [];
+        if (activeRealtimeAsr) {
           try {
-            const recognition = await realtimeAsr.finish();
+            const recognition = await activeRealtimeAsr.finish();
             result = await store.receiveDeviceRealtimeRecognition(
               activeDevice,
               request.commandId ?? undefined,
@@ -450,7 +531,7 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
           hasText: Boolean(result.text),
         });
         logger.log(
-          `Device voice stream completed device=${activeDevice.id} turn=${activeTurnSerial} format=${request.format} wireBytes=${receivedWireBytes} pcmBytes=${receivedPcmBytes} ratio=${receivedWireBytes > 0 ? (receivedPcmBytes / receivedWireBytes).toFixed(2) : '1.00'} chars=${result.text.length} provider=${result.provider} firstPartialMs=${'firstPartialMs' in result ? result.firstPartialMs : 'n/a'}${realtimeFallbackReason ? ` fallback=${realtimeFallbackReason}` : ''}`,
+          `Device voice stream completed device=${activeDevice.id} turn=${activeTurnSerial} format=${request.format} wireBytes=${receivedWireBytes} pcmBytes=${receivedPcmBytes} ratio=${receivedWireBytes > 0 ? (receivedPcmBytes / receivedWireBytes).toFixed(2) : '1.00'} chars=${result.text.length} provider=${result.provider} speechToTranscriptMs=${Date.now() - speechEndedAt} firstPartialMs=${'firstPartialMs' in result ? result.firstPartialMs : 'n/a'}${realtimeFallbackReason ? ` fallback=${realtimeFallbackReason}` : ''}`,
         );
         if (!result.text && activeTurnSerial === turnSerial) {
           emit({ type: 'session.completed' });

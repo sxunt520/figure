@@ -7,6 +7,7 @@ import {
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { RawData, WebSocket } from 'ws';
 
 interface DashScopeResponse {
   output?: {
@@ -17,6 +18,25 @@ interface DashScopeResponse {
   request_id?: string;
   code?: string;
   message?: string;
+}
+
+interface DashScopeRealtimeEvent {
+  header?: {
+    event?: string;
+    error_code?: string;
+    error_message?: string;
+  };
+}
+
+interface SynthesizedAudio {
+  audio: Buffer;
+  requestId: string | null;
+  transport: 'websocket' | 'http';
+  firstPackageMs?: number;
+}
+
+export interface RealtimeTtsStreamCallbacks {
+  onPcmChunk(chunk: Buffer): void;
 }
 
 @Injectable()
@@ -124,6 +144,7 @@ export class TtsService {
     text: string,
     requestedVoiceId?: string | null,
     requestedModel?: string | null,
+    streamCallbacks?: RealtimeTtsStreamCallbacks,
   ) {
     const apiKey = process.env.DASHSCOPE_API_KEY?.trim();
     if (!apiKey) {
@@ -161,6 +182,251 @@ export class TtsService {
       throw new ServiceUnavailableException('文本中没有需要朗读的内容');
     }
 
+    let synthesized: SynthesizedAudio;
+    let realtimeStreamStarted = false;
+    if (process.env.DASHSCOPE_TTS_REALTIME_ENABLED?.trim() !== 'false') {
+      try {
+        synthesized = await this.synthesizeRealtimeAudio(
+          apiKey,
+          model,
+          voice,
+          sampleRate,
+          spokenText,
+          streamCallbacks
+            ? {
+                onPcmChunk: (chunk) => {
+                  realtimeStreamStarted = true;
+                  streamCallbacks.onPcmChunk(chunk);
+                },
+              }
+            : undefined,
+        );
+      } catch (error) {
+        if (realtimeStreamStarted) {
+          throw new ServiceUnavailableException(
+            `实时语音流中断：${error instanceof Error ? error.message : '未知错误'}`,
+          );
+        }
+        this.logger.warn(
+          `Realtime TTS failed; falling back to HTTP: ${
+            error instanceof Error ? error.message : 'unknown error'
+          }`,
+        );
+        synthesized = await this.synthesizeHttpAudio(
+          endpoint,
+          apiKey,
+          model,
+          voice,
+          format,
+          sampleRate,
+          spokenText,
+        );
+      }
+    } else {
+      synthesized = await this.synthesizeHttpAudio(
+        endpoint,
+        apiKey,
+        model,
+        voice,
+        format,
+        sampleRate,
+        spokenText,
+      );
+    }
+    const { audio } = synthesized;
+    if (
+      audio.length < 44 ||
+      audio.toString('ascii', 0, 4) !== 'RIFF' ||
+      audio.toString('ascii', 8, 12) !== 'WAVE'
+    ) {
+      throw new ServiceUnavailableException('阿里云返回的音频不是有效 WAV 文件');
+    }
+    if (audio.length > 8 * 1024 * 1024) {
+      throw new ServiceUnavailableException('生成的音频超过设备支持的 8MB 上限');
+    }
+
+    await mkdir(this.cacheDirectory, { recursive: true });
+    const fileName = `${randomUUID()}.wav`;
+    await writeFile(resolve(this.cacheDirectory, fileName), audio);
+    this.logger.log(
+      `TTS ready model=${model} voice=${voice} transport=${synthesized.transport} bytes=${audio.length} firstPackageMs=${synthesized.firstPackageMs ?? 'n/a'} requestId=${synthesized.requestId ?? 'unknown'}`,
+    );
+    return {
+      audio,
+      audioPath: `/audio/${fileName}`,
+      format: 'wav' as const,
+      sampleRate,
+      voice,
+      model,
+      text: spokenText,
+      provider: 'aliyun-dashscope' as const,
+      requestId: synthesized.requestId,
+    };
+  }
+
+  private synthesizeRealtimeAudio(
+    apiKey: string,
+    model: string,
+    voice: string,
+    sampleRate: number,
+    text: string,
+    streamCallbacks?: RealtimeTtsStreamCallbacks,
+  ): Promise<SynthesizedAudio> {
+    const endpoint =
+      process.env.DASHSCOPE_TTS_WS_ENDPOINT?.trim() ||
+      'wss://dashscope.aliyuncs.com/api-ws/v1/inference';
+    const taskId = randomUUID();
+    const startedAt = Date.now();
+
+    return new Promise((resolvePromise, rejectPromise) => {
+      const chunks: Buffer[] = [];
+      let byteLength = 0;
+      let firstPackageMs: number | undefined;
+      let settled = false;
+      const socket = new WebSocket(endpoint, {
+        headers: {
+          authorization: `bearer ${apiKey}`,
+          'X-DashScope-DataInspection': 'enable',
+        },
+      });
+      const timeout = setTimeout(
+        () => fail(new Error('实时语音合成等待超时')),
+        30_000,
+      );
+      const finish = (pcm: Buffer) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolvePromise({
+          audio: this.wrapPcmAsWav(pcm, sampleRate),
+          requestId: taskId,
+          transport: 'websocket',
+          firstPackageMs,
+        });
+        socket.close();
+      };
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        rejectPromise(error);
+        socket.terminate();
+      };
+      const send = (action: string, payload: Record<string, unknown>) => {
+        socket.send(
+          JSON.stringify({
+            header: { action, task_id: taskId, streaming: 'duplex' },
+            payload,
+          }),
+        );
+      };
+
+      socket.once('open', () => {
+        send('run-task', {
+          task_group: 'audio',
+          task: 'tts',
+          function: 'SpeechSynthesizer',
+          model,
+          parameters: {
+            text_type: 'PlainText',
+            voice,
+            format: 'pcm',
+            sample_rate: sampleRate,
+            volume: 50,
+            rate: 1,
+            pitch: 1,
+            enable_ssml: false,
+          },
+          input: {},
+        });
+      });
+      socket.on('message', (data: RawData, isBinary: boolean) => {
+        if (settled) return;
+        if (isBinary) {
+          const chunk = Array.isArray(data)
+            ? Buffer.concat(data)
+            : Buffer.from(data as ArrayBuffer);
+          if (firstPackageMs === undefined) {
+            firstPackageMs = Date.now() - startedAt;
+          }
+          byteLength += chunk.length;
+          if (byteLength > 8 * 1024 * 1024) {
+            fail(new Error('实时语音音频超过设备支持的 8MB 上限'));
+            return;
+          }
+          chunks.push(chunk);
+          try {
+            streamCallbacks?.onPcmChunk(chunk);
+          } catch (error) {
+            fail(
+              error instanceof Error
+                ? error
+                : new Error('实时语音分块处理失败'),
+            );
+          }
+          return;
+        }
+
+        let event: DashScopeRealtimeEvent;
+        try {
+          event = JSON.parse(data.toString()) as DashScopeRealtimeEvent;
+        } catch {
+          fail(new Error('实时语音服务返回了无效事件'));
+          return;
+        }
+        if (event.header?.event === 'task-started') {
+          send('continue-task', { input: { text } });
+          send('finish-task', { input: {} });
+          return;
+        }
+        if (event.header?.event === 'task-finished') {
+          finish(Buffer.concat(chunks, byteLength));
+          return;
+        }
+        if (event.header?.event === 'task-failed') {
+          fail(
+            new Error(
+              event.header.error_message ||
+                event.header.error_code ||
+                '实时语音合成失败',
+            ),
+          );
+        }
+      });
+      socket.once('error', (error) => fail(error));
+      socket.once('close', () => {
+        if (!settled) fail(new Error('实时语音连接提前关闭'));
+      });
+    });
+  }
+
+  private wrapPcmAsWav(pcm: Buffer, sampleRate: number) {
+    const header = Buffer.alloc(44);
+    header.write('RIFF', 0, 'ascii');
+    header.writeUInt32LE(36 + pcm.length, 4);
+    header.write('WAVE', 8, 'ascii');
+    header.write('fmt ', 12, 'ascii');
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20);
+    header.writeUInt16LE(1, 22);
+    header.writeUInt32LE(sampleRate, 24);
+    header.writeUInt32LE(sampleRate * 2, 28);
+    header.writeUInt16LE(2, 32);
+    header.writeUInt16LE(16, 34);
+    header.write('data', 36, 'ascii');
+    header.writeUInt32LE(pcm.length, 40);
+    return Buffer.concat([header, pcm], 44 + pcm.length);
+  }
+
+  private async synthesizeHttpAudio(
+    endpoint: string,
+    apiKey: string,
+    model: string,
+    voice: string,
+    format: string,
+    sampleRate: number,
+    text: string,
+  ): Promise<SynthesizedAudio> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60_000);
     let response: Response;
@@ -173,12 +439,7 @@ export class TtsService {
         },
         body: JSON.stringify({
           model,
-          input: {
-            text: spokenText,
-            voice,
-            format,
-            sample_rate: sampleRate,
-          },
+          input: { text, voice, format, sample_rate: sampleRate },
         }),
         signal: controller.signal,
       });
@@ -199,45 +460,20 @@ export class TtsService {
         `阿里云语音生成失败：${payload.message || payload.code || response.status}`,
       );
     }
-
     const providerAudioUrl = payload.output?.audio?.url ?? payload.output?.url;
     if (!providerAudioUrl) {
       throw new ServiceUnavailableException('阿里云响应中没有音频地址');
     }
-
     const audioResponse = await fetch(providerAudioUrl);
     if (!audioResponse.ok) {
       throw new ServiceUnavailableException(
         `下载阿里云生成的音频失败：${audioResponse.status}`,
       );
     }
-    const audio = Buffer.from(await audioResponse.arrayBuffer());
-    if (
-      audio.length < 44 ||
-      audio.toString('ascii', 0, 4) !== 'RIFF' ||
-      audio.toString('ascii', 8, 12) !== 'WAVE'
-    ) {
-      throw new ServiceUnavailableException('阿里云返回的音频不是有效 WAV 文件');
-    }
-    if (audio.length > 8 * 1024 * 1024) {
-      throw new ServiceUnavailableException('生成的音频超过设备支持的 8MB 上限');
-    }
-
-    await mkdir(this.cacheDirectory, { recursive: true });
-    const fileName = `${randomUUID()}.wav`;
-    await writeFile(resolve(this.cacheDirectory, fileName), audio);
-    this.logger.log(
-      `TTS ready model=${model} voice=${voice} bytes=${audio.length} requestId=${payload.request_id ?? 'unknown'}`,
-    );
     return {
-      audioPath: `/audio/${fileName}`,
-      format: 'wav' as const,
-      sampleRate,
-      voice,
-      model,
-      text: spokenText,
-      provider: 'aliyun-dashscope' as const,
+      audio: Buffer.from(await audioResponse.arrayBuffer()),
       requestId: payload.request_id ?? null,
+      transport: 'http',
     };
   }
 
