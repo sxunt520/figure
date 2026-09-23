@@ -50,6 +50,7 @@ interface ConversationSpeechTurn {
   characterId: string;
   source: string;
   cancelled: boolean;
+  cancelRealtimeTts?: () => void;
 }
 
 const VOICE_REPLY_PROMPT =
@@ -935,6 +936,103 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private async completeContinuousConversationSpeech(
+    device: DeviceEntity,
+    character: CharacterEntity,
+    turn: ConversationSpeechTurn,
+    text: string,
+    chunkCount: number,
+    assistantMessageId: string,
+    userMessageId: string,
+    aiModel: string,
+    audioStreamId: string,
+    audioStreamStarted: boolean,
+    streamedAudioBytes: number,
+    speech: Awaited<ReturnType<TtsService['synthesize']>>,
+    emitReply?: DeviceRealtimeReplyEmitter,
+  ) {
+    if (audioStreamStarted) {
+      this.emitDeviceRealtimeReply(emitReply, {
+        type: 'reply.audio.stream.end',
+        streamId: audioStreamId,
+        audioBytes: streamedAudioBytes,
+      });
+    }
+    if (!this.isConversationSpeechTurnActive(device.id, turn)) return;
+    const currentDevice = await this.deviceRepository.findOne({
+      where: { id: device.id },
+    });
+    if (
+      currentDevice?.ownerUserId !== device.ownerUserId ||
+      currentDevice.characterId !== character.id ||
+      !this.isDeviceOnline(currentDevice) ||
+      !this.isConversationSpeechTurnActive(device.id, turn)
+    ) {
+      this.logger.log(
+        `Skipping stale continuous conversation speech device=${device.id} turn=${turn.id}`,
+      );
+      return;
+    }
+
+    const command = await this.enqueueCommand(device.id, 'speak_text', {
+      text,
+      characterId: character.id,
+      voiceId: speech.voice,
+      audioPath: speech.audioPath,
+      audioFormat: speech.format,
+      sampleRate: speech.sampleRate,
+      provider: speech.provider,
+      ttsModel: speech.model,
+      aiModel,
+      conversationMessageId: assistantMessageId,
+      userMessageId,
+      conversationTurnId: turn.id,
+      sequence: 0,
+      source: 'device_conversation_continuous_tts',
+    });
+    if (!this.isConversationSpeechTurnActive(device.id, turn)) {
+      command.acknowledgedAt = new Date();
+      await this.commandRepository.save(command);
+      return;
+    }
+    await this.eventRepository.save(
+      this.eventRepository.create({
+        deviceId: device.id,
+        type: 'conversation_speech_chunk_ready',
+        payload: {
+          source: turn.source,
+          conversationTurnId: turn.id,
+          sequence: 0,
+          chunkCount,
+          text,
+          assistantMessageId,
+          userMessageId,
+          commandId: command.id,
+          characterId: character.id,
+          audioPath: speech.audioPath,
+          voiceId: speech.voice,
+          ttsModel: speech.model,
+          transport: 'continuous_pcm',
+        },
+      }),
+    );
+    this.emitDeviceRealtimeReply(emitReply, {
+      type: 'reply.audio',
+      commandId: command.id,
+      conversationTurnId: turn.id,
+      sequence: 0,
+      text,
+      audioPath: speech.audioPath,
+      audioFormat: speech.format,
+      sampleRate: speech.sampleRate,
+      audioData: audioStreamStarted ? undefined : speech.audio,
+      audioStreamId: audioStreamStarted ? audioStreamId : undefined,
+    });
+    this.logger.log(
+      `Continuous conversation speech queued device=${device.id} turn=${turn.id} chunks=${chunkCount} bytes=${streamedAudioBytes}`,
+    );
+  }
+
   private isConversationSpeechTurnActive(
     deviceId: string,
     turn: ConversationSpeechTurn,
@@ -1363,6 +1461,7 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     const activeTurn = this.conversationSpeechTurns.get(deviceId);
     if (activeTurn) {
       activeTurn.cancelled = true;
+      activeTurn.cancelRealtimeTts?.();
       this.conversationSpeechTurns.delete(deviceId);
     }
 
@@ -1380,6 +1479,7 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       return (
         source === 'app_conversation_stream' ||
         source === 'app_conversation_stream_chunk' ||
+        source === 'device_conversation_continuous_tts' ||
         source === 'ai_conversation'
       );
     });
@@ -1804,6 +1904,70 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     let firstSpeechFragmentTimer: NodeJS.Timeout | undefined;
     const conversationStartedAt = Date.now();
     let firstDeltaLogged = false;
+    const useContinuousTts = Boolean(
+      speechTurn && emitReply?.supportsPcmStream,
+    );
+    const continuousAudioStreamId = useContinuousTts ? randomUUID() : null;
+    const continuousSessionRequestedAt = Date.now();
+    let continuousAudioStreamStarted = false;
+    let continuousStreamedAudioBytes = 0;
+    let continuousTtsFailed = false;
+    let continuousTextSubmitted = false;
+    const continuousTtsSession =
+      useContinuousTts && speechTurn && continuousAudioStreamId
+        ? this.tts.createRealtimeSession(
+            character.voiceId,
+            character.ttsModel,
+            {
+              onRawPcmFirstPackage: () => {
+                this.logger.log(
+                  `Device conversation raw TTS first package device=${device.id} turn=${speechTurn.id} elapsedMs=${Date.now() - conversationStartedAt}`,
+                );
+              },
+              onPcmChunk: (chunk) => {
+                if (!continuousAudioStreamStarted) {
+                  continuousAudioStreamStarted = true;
+                  this.logger.log(
+                    `Device conversation first PCM device=${device.id} turn=${speechTurn.id} elapsedMs=${Date.now() - conversationStartedAt} ttsSessionMs=${Date.now() - continuousSessionRequestedAt}`,
+                  );
+                  this.emitDeviceRealtimeReply(emitReply, {
+                    type: 'reply.audio.stream.start',
+                    streamId: continuousAudioStreamId,
+                    conversationTurnId: speechTurn.id,
+                    sequence: 0,
+                    sampleRate: Number(
+                      process.env.DASHSCOPE_TTS_SAMPLE_RATE || 24000,
+                    ),
+                    channels: 1,
+                    format: 'pcm_s16le',
+                  });
+                }
+                continuousStreamedAudioBytes += chunk.length;
+                this.emitDeviceRealtimeReply(emitReply, {
+                  type: 'reply.audio.stream.chunk',
+                  streamId: continuousAudioStreamId,
+                  audioData: chunk,
+                });
+              },
+            },
+          )
+        : null;
+    // The first AI delta can arrive after a failed TTS handshake. The speech
+    // chain handles that failure and falls back to the existing per-chunk
+    // path, while this handler prevents an early unhandled rejection.
+    void continuousTtsSession?.catch(() => undefined);
+    void continuousTtsSession
+      ?.then((session) => {
+        this.logger.debug(
+          `Continuous TTS session ready device=${device.id} turn=${speechTurn!.id} elapsedMs=${Date.now() - conversationStartedAt}`,
+        );
+        if (this.isConversationSpeechTurnActive(device.id, speechTurn!)) {
+          speechTurn!.cancelRealtimeTts = () => session.cancel();
+        } else {
+          session.cancel();
+        }
+      })
+      .catch(() => undefined);
     const clearFirstSpeechFragmentTimer = () => {
       if (!firstSpeechFragmentTimer) return;
       clearTimeout(firstSpeechFragmentTimer);
@@ -1815,8 +1979,27 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
         const spokenText = this.tts.normalizeForSpeech(chunk);
         if (!spokenText) continue;
         const currentSequence = sequence++;
-        speechChain = speechChain.then(() =>
-          this.prepareAppConversationSpeechChunk(
+        speechChain = speechChain.then(async () => {
+          if (continuousTtsSession && !continuousTtsFailed) {
+            try {
+              const session = await continuousTtsSession;
+              await session.pushText(spokenText);
+              continuousTextSubmitted = true;
+              this.logger.debug(
+                `Continuous TTS text submitted device=${device.id} turn=${speechTurn.id} sequence=${currentSequence} chars=${spokenText.length} elapsedMs=${Date.now() - conversationStartedAt}`,
+              );
+              return;
+            } catch (error) {
+              if (continuousTextSubmitted || continuousAudioStreamStarted) {
+                throw error;
+              }
+              continuousTtsFailed = true;
+              this.logger.warn(
+                `Continuous TTS unavailable; using chunk fallback device=${device.id}: ${error instanceof Error ? error.message : 'unknown error'}`,
+              );
+            }
+          }
+          await this.prepareAppConversationSpeechChunk(
             device,
             character,
             speechTurn,
@@ -1826,8 +2009,8 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
             userMessage.id,
             aiModel,
             emitReply,
-          ),
-        );
+          );
+        });
       }
       if (sequence > 0) clearFirstSpeechFragmentTimer();
     };
@@ -1874,6 +2057,9 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       );
     } catch (error) {
       clearFirstSpeechFragmentTimer();
+      void continuousTtsSession
+        ?.then((session) => session.cancel())
+        .catch(() => undefined);
       if (speechTurn) {
         await this.cancelPendingConversationSpeech(device.id, 'stream_failed');
       }
@@ -1895,15 +2081,42 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
     assistantMessageId = assistantMessage.id;
     if (speechTurn) {
       void speechChain
-        .then(() =>
-          this.finishAppConversationSpeech(
+        .then(async () => {
+          if (
+            continuousTtsSession &&
+            continuousAudioStreamId &&
+            !continuousTtsFailed &&
+            continuousTextSubmitted
+          ) {
+            const session = await continuousTtsSession;
+            const speech = await session.finish();
+            await this.completeContinuousConversationSpeech(
+              device,
+              character,
+              speechTurn,
+              reply.content,
+              sequence,
+              assistantMessage.id,
+              userMessage.id,
+              aiModel,
+              continuousAudioStreamId,
+              continuousAudioStreamStarted,
+              continuousStreamedAudioBytes,
+              speech,
+              emitReply,
+            );
+          } else if (continuousTtsSession && !continuousTtsFailed) {
+            const session = await continuousTtsSession;
+            session.cancel();
+          }
+          await this.finishAppConversationSpeech(
             device.id,
             speechTurn,
             assistantMessage.id,
             sequence,
             emitReply,
-          ),
-        )
+          );
+        })
         .catch((error) =>
           this.failAppConversationSpeech(
             device.id,

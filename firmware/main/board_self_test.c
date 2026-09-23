@@ -2591,7 +2591,10 @@ static void nfc_event_uploader_task(void *arg)
 #define VOICE_WS_PCM_STREAM_END_BIT BIT10
 #define VOICE_WS_REPLY_QUEUE_LENGTH 8U
 #define VOICE_WS_PCM_QUEUE_LENGTH 256U
-#define VOICE_WS_PCM_JITTER_BYTES 16384U
+#define VOICE_WS_PCM_JITTER_MIN_BYTES 4096U
+#define VOICE_WS_PCM_JITTER_NORMAL_BYTES 8192U
+#define VOICE_WS_PCM_JITTER_MAX_BYTES 12288U
+#define VOICE_WS_PCM_RATE_SAMPLE_MS 60U
 
 typedef struct {
     uint8_t *data;
@@ -2622,6 +2625,9 @@ typedef struct {
     char pcm_stream_id[40];
     uint32_t pcm_stream_sample_rate;
     volatile size_t pcm_stream_buffered_bytes;
+    volatile size_t pcm_stream_received_bytes;
+    TickType_t pcm_stream_first_chunk_at;
+    uint32_t pcm_stream_jitter_target_bytes;
     volatile bool pcm_stream_active;
     volatile bool pcm_stream_ended;
     volatile bool pcm_stream_failed;
@@ -2675,6 +2681,10 @@ static void clear_voice_ws_pcm_stream(voice_ws_context_t *context)
     context->pcm_stream_id[0] = '\0';
     context->pcm_stream_sample_rate = 0;
     context->pcm_stream_buffered_bytes = 0;
+    context->pcm_stream_received_bytes = 0;
+    context->pcm_stream_first_chunk_at = 0;
+    context->pcm_stream_jitter_target_bytes =
+        VOICE_WS_PCM_JITTER_NORMAL_BYTES;
     context->pcm_stream_active = false;
     context->pcm_stream_ended = false;
     context->pcm_stream_failed = false;
@@ -2760,7 +2770,11 @@ static void voice_websocket_event(void *handler_arg, esp_event_base_t base,
             xEventGroupSetBits(context->events, VOICE_WS_PCM_STREAM_END_BIT);
             return;
         }
+        if (context->pcm_stream_first_chunk_at == 0) {
+            context->pcm_stream_first_chunk_at = xTaskGetTickCount();
+        }
         context->pcm_stream_buffered_bytes += chunk.length;
+        context->pcm_stream_received_bytes += chunk.length;
         return;
     }
 
@@ -2853,6 +2867,8 @@ static void voice_websocket_event(void *handler_arg, esp_event_base_t base,
             strlcpy(context->pcm_stream_id, stream_id->valuestring,
                     sizeof(context->pcm_stream_id));
             context->pcm_stream_sample_rate = (uint32_t)sample_rate->valueint;
+            context->pcm_stream_jitter_target_bytes =
+                VOICE_WS_PCM_JITTER_NORMAL_BYTES;
             context->pcm_stream_active = true;
             ESP_LOGI(TAG, "PCM reply stream started: id=%s rate=%" PRIu32,
                      context->pcm_stream_id,
@@ -3034,6 +3050,37 @@ static bool speaker_play_pcm16_mono_chunk(const uint8_t *pcm,
     return true;
 }
 
+static uint32_t update_pcm_jitter_target(voice_ws_context_t *context)
+{
+    if (context == NULL || context->pcm_stream_first_chunk_at == 0 ||
+        context->pcm_stream_sample_rate == 0) {
+        return VOICE_WS_PCM_JITTER_NORMAL_BYTES;
+    }
+    const TickType_t now = xTaskGetTickCount();
+    const uint32_t elapsed_ms =
+        (uint32_t)((now - context->pcm_stream_first_chunk_at) *
+                   portTICK_PERIOD_MS);
+    if (elapsed_ms < VOICE_WS_PCM_RATE_SAMPLE_MS) {
+        return context->pcm_stream_jitter_target_bytes;
+    }
+    const uint64_t required_bytes_per_second =
+        (uint64_t)context->pcm_stream_sample_rate * 2U;
+    const uint64_t received_bytes_per_second =
+        ((uint64_t)context->pcm_stream_received_bytes * 1000U) / elapsed_ms;
+    if (received_bytes_per_second >= required_bytes_per_second * 18U / 10U) {
+        context->pcm_stream_jitter_target_bytes =
+            VOICE_WS_PCM_JITTER_MIN_BYTES;
+    } else if (received_bytes_per_second >=
+               required_bytes_per_second * 115U / 100U) {
+        context->pcm_stream_jitter_target_bytes =
+            VOICE_WS_PCM_JITTER_NORMAL_BYTES;
+    } else {
+        context->pcm_stream_jitter_target_bytes =
+            VOICE_WS_PCM_JITTER_MAX_BYTES;
+    }
+    return context->pcm_stream_jitter_target_bytes;
+}
+
 static bool play_realtime_pcm_stream(voice_ws_context_t *context)
 {
     if (context == NULL || context->pcm_queue == NULL ||
@@ -3042,8 +3089,9 @@ static bool play_realtime_pcm_stream(voice_ws_context_t *context)
     }
     const TickType_t buffering_started_at = xTaskGetTickCount();
     while (!context->pcm_stream_failed && !context->pcm_stream_ended &&
-           context->pcm_stream_buffered_bytes < VOICE_WS_PCM_JITTER_BYTES &&
            xTaskGetTickCount() - buffering_started_at < pdMS_TO_TICKS(5000)) {
+        const uint32_t target_bytes = update_pcm_jitter_target(context);
+        if (context->pcm_stream_buffered_bytes >= target_bytes) break;
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     if (context->pcm_stream_failed ||
@@ -3064,9 +3112,15 @@ static bool play_realtime_pcm_stream(voice_ws_context_t *context)
     if (!speaker_set_sample_rate(context->pcm_stream_sample_rate)) {
         succeeded = false;
     }
-    ESP_LOGI(TAG, "PCM reply playback started: buffered=%u jitter=%" PRIu32
-                  "ms",
+    const uint32_t jitter_target = update_pcm_jitter_target(context);
+    const uint32_t buffered_audio_ms = context->pcm_stream_sample_rate == 0
+                                           ? 0
+                                           : (uint32_t)(((uint64_t)context->pcm_stream_buffered_bytes * 1000U) /
+                                                        ((uint64_t)context->pcm_stream_sample_rate * 2U));
+    ESP_LOGI(TAG, "PCM reply playback started: buffered=%u audio=%" PRIu32
+                  "ms target=%" PRIu32 " jitter=%" PRIu32 "ms",
              (unsigned)context->pcm_stream_buffered_bytes,
+             buffered_audio_ms, jitter_target,
              (uint32_t)((xTaskGetTickCount() - buffering_started_at) *
                         portTICK_PERIOD_MS));
     while (succeeded && !context->pcm_stream_failed) {
