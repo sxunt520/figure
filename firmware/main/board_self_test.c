@@ -55,6 +55,7 @@
 #define VOICE_OPUS_MAX_PACKET_BYTES 1275U
 #define VOICE_TASK_STACK_BYTES (64U * 1024U)
 #define VOICE_WS_READY_TIMEOUT_MS 15000U
+#define VOICE_PREROLL_READ_FRAMES 128U
 #define WAV_HEADER_BYTES 44U
 #define VOLUME_STEP 5U
 #define API_BASE_URL_CAPACITY 192U
@@ -931,7 +932,12 @@ static bool record_microphone_wav(uint32_t duration_ms,
     uint32_t calibration_blocks = 0;
     uint32_t noise_floor = 0;
     uint32_t vad_threshold = CONFIG_FIGURE_VAD_THRESHOLD;
-    const uint32_t calibration_frames = MICROPHONE_SAMPLE_RATE / 3U;
+    // Push-to-talk already gives us an explicit start/stop gesture. Do not
+    // treat its first 333 ms as ambient calibration: users naturally start
+    // speaking immediately and their voice would otherwise raise the noise
+    // floor enough to produce the misleading `speech=no` result.
+    const uint32_t calibration_frames =
+        stop_on_button_release ? 0U : MICROPHONE_SAMPLE_RATE / 3U;
     const uint32_t start_required_frames = MICROPHONE_SAMPLE_RATE / 25U;
     const uint32_t silence_limit_frames =
         (MICROPHONE_SAMPLE_RATE * CONFIG_FIGURE_VAD_SILENCE_MS) / 1000U;
@@ -994,7 +1000,9 @@ static bool record_microphone_wav(uint32_t duration_ms,
         }
 
         const bool calibration_done = written_frames > calibration_frames;
-        const bool active = calibration_done && average >= vad_threshold;
+        const bool active = calibration_done &&
+                            (average >= vad_threshold ||
+                             peak >= vad_threshold * 5U);
         if (!speech_detected) {
             active_run_frames = active ? active_run_frames + copy_frames : 0;
             if (active_run_frames >= start_required_frames) {
@@ -3562,10 +3570,108 @@ static bool send_voice_opus_frame(esp_websocket_client_handle_t client,
     return true;
 }
 
+static int16_t *capture_microphone_preroll(
+    voice_ws_context_t *context, uint32_t duration_ms,
+    bool stop_on_button_release, size_t *captured_frames,
+    EventBits_t *terminal_bits)
+{
+    if (captured_frames == NULL || terminal_bits == NULL || context == NULL ||
+        context->events == NULL) {
+        return NULL;
+    }
+    *captured_frames = 0;
+    *terminal_bits = 0;
+
+    const size_t capacity_frames =
+        ((size_t)MICROPHONE_SAMPLE_RATE * duration_ms) / 1000U;
+    int16_t *buffer = heap_caps_malloc(capacity_frames * sizeof(int16_t),
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buffer == NULL) {
+        ESP_LOGW(TAG, "Unable to allocate voice preroll buffer; waiting live");
+        *terminal_bits = xEventGroupWaitBits(
+            context->events,
+            VOICE_WS_READY_BIT | VOICE_WS_ERROR_BIT |
+                VOICE_WS_DISCONNECTED_BIT,
+            pdFALSE, pdFALSE, pdMS_TO_TICKS(VOICE_WS_READY_TIMEOUT_MS));
+        return NULL;
+    }
+
+    // Drop one stale DMA block left from idle monitoring. From this point on,
+    // every microphone sample belongs to the button press and is preserved.
+    int32_t input[VOICE_PREROLL_READ_FRAMES * 2U];
+    size_t discarded = 0;
+    (void)i2s_channel_read(microphone_rx_channel, input, sizeof(input),
+                           &discarded, 0);
+
+    const TickType_t started_at = xTaskGetTickCount();
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(VOICE_WS_READY_TIMEOUT_MS);
+    while (*captured_frames < capacity_frames) {
+        *terminal_bits = xEventGroupGetBits(context->events);
+        if ((*terminal_bits &
+             (VOICE_WS_READY_BIT | VOICE_WS_ERROR_BIT |
+              VOICE_WS_DISCONNECTED_BIT)) != 0) {
+            break;
+        }
+#ifdef CONFIG_FIGURE_ENABLE_TALK_BUTTON
+        if (stop_on_button_release && !talk_button_down &&
+            *captured_frames > 0) {
+            break;
+        }
+#endif
+        if (xTaskGetTickCount() - started_at >= timeout_ticks) break;
+
+        size_t bytes_read = 0;
+        const esp_err_t error = i2s_channel_read(
+            microphone_rx_channel, input, sizeof(input), &bytes_read,
+            pdMS_TO_TICKS(20));
+        if (error == ESP_ERR_TIMEOUT || bytes_read == 0) continue;
+        if (error != ESP_OK) {
+            ESP_LOGE(TAG, "Microphone preroll read failed: %s",
+                     esp_err_to_name(error));
+            break;
+        }
+        const size_t available_frames =
+            bytes_read / (2U * sizeof(int32_t));
+        const size_t remaining_frames = capacity_frames - *captured_frames;
+        const size_t copied_frames = available_frames < remaining_frames
+                                         ? available_frames
+                                         : remaining_frames;
+        for (size_t frame = 0; frame < copied_frames; ++frame) {
+            buffer[*captured_frames + frame] =
+                microphone_sample_to_pcm16(input[frame * 2U]);
+        }
+        *captured_frames += copied_frames;
+    }
+
+    *terminal_bits = xEventGroupGetBits(context->events);
+    if ((*terminal_bits &
+         (VOICE_WS_READY_BIT | VOICE_WS_ERROR_BIT |
+          VOICE_WS_DISCONNECTED_BIT)) == 0) {
+        const TickType_t elapsed = xTaskGetTickCount() - started_at;
+        const TickType_t remaining = elapsed < timeout_ticks
+                                         ? timeout_ticks - elapsed
+                                         : 0;
+        *terminal_bits = xEventGroupWaitBits(
+            context->events,
+            VOICE_WS_READY_BIT | VOICE_WS_ERROR_BIT |
+                VOICE_WS_DISCONNECTED_BIT,
+            pdFALSE, pdFALSE, remaining);
+    }
+
+    ESP_LOGI(TAG, "Voice preroll captured: %u frames (%ums) ready=%s",
+             (unsigned)*captured_frames,
+             (unsigned)((*captured_frames * 1000U) /
+                        MICROPHONE_SAMPLE_RATE),
+             (*terminal_bits & VOICE_WS_READY_BIT) != 0 ? "yes" : "no");
+    return buffer;
+}
+
 static bool stream_microphone_audio(esp_websocket_client_handle_t client,
                                     uint32_t duration_ms,
                                     bool stop_on_button_release,
-                                    voice_opus_encoder_t *opus_encoder)
+                                    voice_opus_encoder_t *opus_encoder,
+                                    const int16_t *initial_pcm,
+                                    size_t initial_pcm_frames)
 {
     const uint32_t max_frame_count =
         (MICROPHONE_SAMPLE_RATE * duration_ms) / 1000U;
@@ -3573,10 +3679,8 @@ static bool stream_microphone_audio(esp_websocket_client_handle_t client,
     int16_t pcm[128];
     int16_t opus_pcm[VOICE_OPUS_FRAME_SAMPLES];
     size_t opus_pcm_count = 0;
+    size_t initial_pcm_position = 0;
     uint32_t wire_bytes = 0;
-    size_t discarded = 0;
-    (void)i2s_channel_read(microphone_rx_channel, input, sizeof(input),
-                           &discarded, pdMS_TO_TICKS(100));
 
     uint32_t written_frames = 0;
     uint32_t active_run_frames = 0;
@@ -3587,7 +3691,8 @@ static bool stream_microphone_audio(esp_websocket_client_handle_t client,
     uint32_t calibration_blocks = 0;
     uint32_t noise_floor = 0;
     uint32_t vad_threshold = CONFIG_FIGURE_VAD_THRESHOLD;
-    const uint32_t calibration_frames = MICROPHONE_SAMPLE_RATE / 3U;
+    const uint32_t calibration_frames =
+        stop_on_button_release ? 0U : MICROPHONE_SAMPLE_RATE / 3U;
     const uint32_t start_required_frames = MICROPHONE_SAMPLE_RATE / 25U;
     const uint32_t silence_limit_frames =
         (MICROPHONE_SAMPLE_RATE * CONFIG_FIGURE_VAD_SILENCE_MS) / 1000U;
@@ -3597,26 +3702,43 @@ static bool stream_microphone_audio(esp_websocket_client_handle_t client,
         (MICROPHONE_SAMPLE_RATE * CONFIG_FIGURE_VAD_MIN_RECORD_MS) / 1000U;
 
     while (written_frames < max_frame_count) {
-        size_t bytes_read = 0;
-        const esp_err_t error = i2s_channel_read(
-            microphone_rx_channel, input, sizeof(input), &bytes_read,
-            pdMS_TO_TICKS(1000));
-        if (error != ESP_OK || bytes_read == 0) {
-            ESP_LOGE(TAG, "Microphone streaming read failed: %s",
-                     esp_err_to_name(error));
-            return false;
-        }
-
-        const size_t available_frames = bytes_read / (2U * sizeof(int32_t));
         const uint32_t remaining_frames = max_frame_count - written_frames;
-        const size_t copy_frames = available_frames < remaining_frames
-                                       ? available_frames
-                                       : remaining_frames;
+        size_t copy_frames = 0;
+        if (initial_pcm != NULL &&
+            initial_pcm_position < initial_pcm_frames) {
+            const size_t initial_remaining =
+                initial_pcm_frames - initial_pcm_position;
+            copy_frames = initial_remaining < VOICE_PREROLL_READ_FRAMES
+                              ? initial_remaining
+                              : VOICE_PREROLL_READ_FRAMES;
+            if (copy_frames > remaining_frames) copy_frames = remaining_frames;
+            memcpy(pcm, initial_pcm + initial_pcm_position,
+                   copy_frames * sizeof(int16_t));
+            initial_pcm_position += copy_frames;
+        } else {
+            size_t bytes_read = 0;
+            const esp_err_t error = i2s_channel_read(
+                microphone_rx_channel, input, sizeof(input), &bytes_read,
+                pdMS_TO_TICKS(1000));
+            if (error != ESP_OK || bytes_read == 0) {
+                ESP_LOGE(TAG, "Microphone streaming read failed: %s",
+                         esp_err_to_name(error));
+                return false;
+            }
+            const size_t available_frames =
+                bytes_read / (2U * sizeof(int32_t));
+            copy_frames = available_frames < remaining_frames
+                              ? available_frames
+                              : remaining_frames;
+            for (size_t frame = 0; frame < copy_frames; ++frame) {
+                pcm[frame] =
+                    microphone_sample_to_pcm16(input[frame * 2U]);
+            }
+        }
         uint64_t absolute_sum = 0;
         uint32_t peak = 0;
         for (size_t frame = 0; frame < copy_frames; ++frame) {
-            const int16_t sample = microphone_sample_to_pcm16(input[frame * 2]);
-            pcm[frame] = sample;
+            const int16_t sample = pcm[frame];
             const uint32_t absolute = sample == INT16_MIN
                                           ? INT16_MAX
                                           : (uint32_t)(sample < 0 ? -sample : sample);
@@ -3678,7 +3800,9 @@ static bool stream_microphone_audio(esp_websocket_client_handle_t client,
         }
 
         const bool calibration_done = written_frames > calibration_frames;
-        const bool active = calibration_done && average >= vad_threshold;
+        const bool active = calibration_done &&
+                            (average >= vad_threshold ||
+                             peak >= vad_threshold * 5U);
         if (!speech_detected) {
             active_run_frames = active ? active_run_frames + copy_frames : 0;
             if (active_run_frames >= start_required_frames) {
@@ -3702,7 +3826,10 @@ static bool stream_microphone_audio(esp_websocket_client_handle_t client,
         }
 #endif
 
-        if (stop_on_button_release && written_frames >= minimum_frames) {
+        const bool preroll_drained =
+            initial_pcm == NULL || initial_pcm_position >= initial_pcm_frames;
+        if (stop_on_button_release && preroll_drained &&
+            written_frames >= minimum_frames) {
 #ifdef CONFIG_FIGURE_ENABLE_TALK_BUTTON
             if (!talk_button_down) break;
 #endif
@@ -3794,12 +3921,14 @@ static voice_stream_result_t record_and_stream_websocket(
         }
         return VOICE_STREAM_UNAVAILABLE;
     }
-    EventBits_t bits = xEventGroupWaitBits(
-        context->events,
-        VOICE_WS_READY_BIT | VOICE_WS_ERROR_BIT | VOICE_WS_DISCONNECTED_BIT,
-        pdFALSE, pdFALSE, pdMS_TO_TICKS(VOICE_WS_READY_TIMEOUT_MS));
+    device_set_state(DEVICE_STATE_LISTENING);
+    size_t preroll_frames = 0;
+    EventBits_t bits = 0;
+    int16_t *preroll_pcm = capture_microphone_preroll(
+        context, duration_ms, push_to_talk, &preroll_frames, &bits);
     if ((bits & VOICE_WS_READY_BIT) == 0) {
         ESP_LOGW(TAG, "Voice WebSocket authentication failed");
+        free(preroll_pcm);
         close_voice_opus_encoder(opus_encoder);
         close_persistent_voice_websocket();
         if (restore_power_save) {
@@ -3813,9 +3942,10 @@ static voice_stream_result_t record_and_stream_websocket(
              (uint32_t)((connected_at - turn_started_at) * portTICK_PERIOD_MS),
              (uint32_t)((ready_at - connected_at) * portTICK_PERIOD_MS));
 
-    device_set_state(DEVICE_STATE_LISTENING);
     const bool recorded = stream_microphone_audio(
-        client, duration_ms, push_to_talk, opus_encoder);
+        client, duration_ms, push_to_talk, opus_encoder,
+        preroll_pcm, preroll_frames);
+    free(preroll_pcm);
     close_voice_opus_encoder(opus_encoder);
     opus_encoder = NULL;
     voice_stream_result_t result = VOICE_STREAM_FAILED;

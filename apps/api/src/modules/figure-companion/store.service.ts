@@ -54,13 +54,15 @@ interface ConversationSpeechTurn {
 }
 
 const VOICE_REPLY_PROMPT =
-  '这是语音对话。请用自然、简短、完整的句子直接回答；不要为了抢播把一句话拆成几个短句。';
+  '这是语音对话。请用自然、简短、完整的句子直接回答。首句优先用8到18个字表达完整意思，并以句号、问号或叹号结束；不要用“嗯”“啊”“呃”或省略号拖音开场，不要输出括号内的动作、神态或声音描写，不要为了抢播拆成几个零碎短句。';
 // Debounce the first unpunctuated fragment instead of starting a one-shot
 // timer on the first model delta. Providers often split a natural sentence
 // like `我在呢，有什么...` immediately before the comma; a short quiet
 // window lets the following clause arrive without adding much latency when
 // the model genuinely pauses.
-const FIRST_SPEECH_FRAGMENT_DELAY_MS = 250;
+const FIRST_SPEECH_FRAGMENT_DELAY_MS = 200;
+const FIRST_SPEECH_FRAGMENT_MIN_CHARS = 8;
+const FIRST_SPEECH_FRAGMENT_MAX_CHARS = 16;
 
 export type DeviceRealtimeReplyEvent =
   | { type: 'reply.started'; conversationTurnId: string }
@@ -649,7 +651,10 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       firstSpeechFragmentTimer = setTimeout(() => {
         firstSpeechFragmentTimer = undefined;
         if (speechSequence > 0) return;
-        const chunks = speechChunker.takeEarlyFragment();
+        const chunks = speechChunker.takeEarlyFragment(
+          FIRST_SPEECH_FRAGMENT_MIN_CHARS,
+          FIRST_SPEECH_FRAGMENT_MAX_CHARS,
+        );
         if (chunks.length > 0) {
           this.logger.debug(
             `App conversation early speech fragment device=${device.id} chars=${this.tts.normalizeForSpeech(chunks[0]).length} elapsedMs=${Date.now() - conversationStartedAt}`,
@@ -1765,6 +1770,10 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
           'recognitionElapsedMs' in recognition
             ? recognition.recognitionElapsedMs
             : null,
+        finalizationElapsedMs:
+          'finalizationElapsedMs' in recognition
+            ? recognition.finalizationElapsedMs
+            : null,
       },
     });
     await Promise.all([
@@ -2020,7 +2029,10 @@ export class StoreService implements OnModuleInit, OnModuleDestroy {
       firstSpeechFragmentTimer = setTimeout(() => {
         firstSpeechFragmentTimer = undefined;
         if (sequence > 0) return;
-        const chunks = chunker.takeEarlyFragment();
+        const chunks = chunker.takeEarlyFragment(
+          FIRST_SPEECH_FRAGMENT_MIN_CHARS,
+          FIRST_SPEECH_FRAGMENT_MAX_CHARS,
+        );
         if (chunks.length > 0) {
           this.logger.debug(
             `Device conversation early speech fragment device=${device.id} chars=${this.tts.normalizeForSpeech(chunks[0]).length} elapsedMs=${Date.now() - conversationStartedAt}`,

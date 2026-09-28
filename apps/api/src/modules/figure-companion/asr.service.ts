@@ -60,6 +60,7 @@ export interface RealtimeAsrResult extends WavMetadata {
   provider: 'aliyun-nls-realtime';
   firstPartialMs: number | null;
   recognitionElapsedMs: number;
+  finalizationElapsedMs: number | null;
 }
 
 export interface RealtimeAsrSession {
@@ -68,7 +69,9 @@ export interface RealtimeAsrSession {
   abort(): void;
 }
 
-const REALTIME_PCM_FRAME_BYTES = 3200;
+// Send 50 ms of 16 kHz mono PCM per frame. The previous 100 ms batching
+// added avoidable latency to every intermediate and final recognition event.
+const REALTIME_PCM_FRAME_BYTES = 1600;
 
 class AliyunRealtimeAsrSession implements RealtimeAsrSession {
   private readonly socket: WebSocket;
@@ -78,6 +81,7 @@ class AliyunRealtimeAsrSession implements RealtimeAsrSession {
   private currentResult = '';
   private dataBytes = 0;
   private firstPartialMs: number | null = null;
+  private stoppingAt: number | null = null;
   private started = false;
   private stopping = false;
   private settled = false;
@@ -103,6 +107,8 @@ class AliyunRealtimeAsrSession implements RealtimeAsrSession {
     token: string,
     private readonly appKey: string,
     private readonly taskId: string,
+    private readonly maxSentenceSilenceMs: number,
+    private readonly finalizationTimeoutMs: number,
     private readonly onProgress?: (progress: RealtimeAsrProgress) => void,
   ) {
     const url = new URL(endpoint);
@@ -152,6 +158,7 @@ class AliyunRealtimeAsrSession implements RealtimeAsrSession {
     if (!this.started || this.settled) return this.completionPromise;
     if (!this.stopping) {
       this.stopping = true;
+      this.stoppingAt = Date.now();
       if (this.pendingAudio.length) {
         this.socket.send(this.pendingAudio, { binary: true });
         this.pendingAudio = Buffer.alloc(0);
@@ -169,7 +176,7 @@ class AliyunRealtimeAsrSession implements RealtimeAsrSession {
       );
       this.completionTimeout = setTimeout(
         () => this.fail(new Error('实时语音识别结束超时')),
-        20_000,
+        this.finalizationTimeoutMs,
       );
     }
     return this.completionPromise;
@@ -195,6 +202,7 @@ class AliyunRealtimeAsrSession implements RealtimeAsrSession {
           enable_intermediate_result: true,
           enable_punctuation_prediction: true,
           enable_inverse_text_normalization: true,
+          max_sentence_silence: this.maxSentenceSilenceMs,
         },
       }),
     );
@@ -290,6 +298,8 @@ class AliyunRealtimeAsrSession implements RealtimeAsrSession {
       durationMs: Math.round((this.dataBytes * 1000) / 32000),
       firstPartialMs: this.firstPartialMs,
       recognitionElapsedMs: Date.now() - this.startedAt,
+      finalizationElapsedMs:
+        this.stoppingAt === null ? null : Date.now() - this.stoppingAt,
     });
     this.socket.close(1000, 'completed');
   }
@@ -331,11 +341,25 @@ export class AsrService {
     const endpoint =
       process.env.ALIYUN_NLS_REALTIME_ENDPOINT?.trim() ||
       'wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1';
+    const maxSentenceSilenceMs = boundedInteger(
+      process.env.ALIYUN_NLS_ASR_MAX_SENTENCE_SILENCE_MS,
+      500,
+      200,
+      2000,
+    );
+    const finalizationTimeoutMs = boundedInteger(
+      process.env.ALIYUN_NLS_ASR_FINAL_TIMEOUT_MS,
+      5000,
+      2000,
+      20000,
+    );
     const session = new AliyunRealtimeAsrSession(
       endpoint,
       token,
       appKey,
       randomId(),
+      maxSentenceSilenceMs,
+      finalizationTimeoutMs,
       onProgress,
     );
     try {
@@ -545,4 +569,16 @@ export class AsrService {
     }
     return value;
   }
+}
+
+function boundedInteger(
+  rawValue: string | undefined,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+) {
+  const value = Number(rawValue ?? fallback);
+  return Number.isInteger(value) && value >= minimum && value <= maximum
+    ? value
+    : fallback;
 }

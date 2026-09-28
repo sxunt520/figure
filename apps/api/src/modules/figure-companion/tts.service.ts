@@ -62,9 +62,19 @@ export interface RealtimeTtsSession {
 
 const PCM_GATE_FRAME_MS = 10;
 const PCM_GATE_SILENCE_RMS = 420;
-const PCM_GATE_MAX_PREFIX_MS = 350;
+const PCM_GATE_CONSERVATIVE_PREFIX_MS = 350;
+const PCM_GATE_DEFAULT_PREFIX_MS = 300;
+const PCM_GATE_FAST_PREFIX_MS = 240;
+const PCM_GATE_FAST_CLEAN_STREAK = 3;
+const PCM_GATE_RECOVERY_TURNS = 6;
 const PCM_GATE_MIN_GAP_MS = 220;
 const PCM_GATE_DECISION_MS = 800;
+
+interface LeadingArtifactProfile {
+  cleanStreak: number;
+  conservativeTurnsRemaining: number;
+  artifactCount: number;
+}
 
 /**
  * Some cloned CosyVoice voices occasionally emit a short, unrelated syllable
@@ -82,7 +92,10 @@ class LeadingPcmArtifactGate {
   private scannedFrames = 0;
   trimmedBytes = 0;
 
-  constructor(private readonly sampleRate: number) {
+  constructor(
+    private readonly sampleRate: number,
+    readonly maxPrefixMs = PCM_GATE_CONSERVATIVE_PREFIX_MS,
+  ) {
     this.frameBytes = Math.max(
       2,
       Math.floor((sampleRate * PCM_GATE_FRAME_MS) / 1000) * 2,
@@ -137,7 +150,7 @@ class LeadingPcmArtifactGate {
         const silenceMs =
           (this.scannedFrames + 1 - this.silenceStartFrame) * PCM_GATE_FRAME_MS;
         if (
-          voicedPrefixMs <= PCM_GATE_MAX_PREFIX_MS &&
+          voicedPrefixMs <= this.maxPrefixMs &&
           silenceMs >= PCM_GATE_MIN_GAP_MS
         ) {
           const discardedBytes = (this.scannedFrames + 1) * this.frameBytes;
@@ -158,7 +171,7 @@ class LeadingPcmArtifactGate {
         this.voicedStartFrame !== null &&
         this.silenceStartFrame === null &&
         (this.scannedFrames - this.voicedStartFrame) * PCM_GATE_FRAME_MS >
-          PCM_GATE_MAX_PREFIX_MS
+          this.maxPrefixMs
       ) {
         const buffered = this.pending;
         this.pending = Buffer.alloc(0);
@@ -212,6 +225,10 @@ export class TtsService implements OnModuleDestroy {
   private readonly cacheDirectory = resolve(process.cwd(), '.data', 'tts');
   private readonly realtimeSocketPool = new Map<string, WebSocket[]>();
   private readonly realtimeSocketIdleTimers = new Map<WebSocket, NodeJS.Timeout>();
+  private readonly leadingArtifactProfiles = new Map<
+    string,
+    LeadingArtifactProfile
+  >();
 
   onModuleDestroy() {
     for (const timer of this.realtimeSocketIdleTimers.values()) {
@@ -222,6 +239,7 @@ export class TtsService implements OnModuleDestroy {
       for (const socket of sockets) socket.terminate();
     }
     this.realtimeSocketPool.clear();
+    this.leadingArtifactProfiles.clear();
   }
 
   async cloneVoice(
@@ -496,6 +514,72 @@ export class TtsService implements OnModuleDestroy {
     };
   }
 
+  private leadingArtifactGateProfile(voice: string) {
+    const adaptiveEnabled =
+      process.env.DASHSCOPE_TTS_LEADING_ARTIFACT_ADAPTIVE?.trim() !== 'false';
+    if (!adaptiveEnabled) {
+      return {
+        mode: 'fixed' as const,
+        maxPrefixMs: PCM_GATE_CONSERVATIVE_PREFIX_MS,
+      };
+    }
+
+    const profile = this.leadingArtifactProfiles.get(voice);
+    if (profile?.conservativeTurnsRemaining) {
+      return {
+        mode: 'conservative' as const,
+        maxPrefixMs: PCM_GATE_CONSERVATIVE_PREFIX_MS,
+      };
+    }
+    if ((profile?.cleanStreak ?? 0) >= PCM_GATE_FAST_CLEAN_STREAK) {
+      return {
+        mode: 'fast' as const,
+        maxPrefixMs: PCM_GATE_FAST_PREFIX_MS,
+      };
+    }
+    return {
+      mode: 'learning' as const,
+      maxPrefixMs: PCM_GATE_DEFAULT_PREFIX_MS,
+    };
+  }
+
+  private recordLeadingArtifactResult(voice: string, artifactDetected: boolean) {
+    const existing = this.leadingArtifactProfiles.get(voice) ?? {
+      cleanStreak: 0,
+      conservativeTurnsRemaining: 0,
+      artifactCount: 0,
+    };
+    const profile = artifactDetected
+      ? {
+          cleanStreak: 0,
+          conservativeTurnsRemaining: PCM_GATE_RECOVERY_TURNS,
+          artifactCount: existing.artifactCount + 1,
+        }
+      : {
+          cleanStreak: Math.min(20, existing.cleanStreak + 1),
+          conservativeTurnsRemaining: Math.max(
+            0,
+            existing.conservativeTurnsRemaining - 1,
+          ),
+          artifactCount: existing.artifactCount,
+        };
+
+    // A server normally has only a handful of character voices. Keep a hard
+    // bound nevertheless so arbitrary voice IDs cannot grow process memory.
+    if (
+      !this.leadingArtifactProfiles.has(voice) &&
+      this.leadingArtifactProfiles.size >= 32
+    ) {
+      const oldestVoice = this.leadingArtifactProfiles.keys().next().value;
+      if (oldestVoice) this.leadingArtifactProfiles.delete(oldestVoice);
+    }
+    this.leadingArtifactProfiles.set(voice, profile);
+    const next = this.leadingArtifactGateProfile(voice);
+    this.logger.debug(
+      `Realtime TTS gate profile voice=${voice} result=${artifactDetected ? 'artifact' : 'clean'} cleanStreak=${profile.cleanStreak} recovery=${profile.conservativeTurnsRemaining} artifacts=${profile.artifactCount} next=${next.mode}/${next.maxPrefixMs}ms`,
+    );
+  }
+
   private async openRealtimeSession(
     apiKey: string,
     model: string,
@@ -538,8 +622,11 @@ export class TtsService implements OnModuleDestroy {
       const filterLeadingArtifact =
         leadingArtifactFilterMode !== 'false' &&
         (leadingArtifactFilterMode === 'all' || voice.includes('-bailian-'));
+      const gateProfile = filterLeadingArtifact
+        ? this.leadingArtifactGateProfile(voice)
+        : null;
       const leadingArtifactGate = filterLeadingArtifact
-        ? new LeadingPcmArtifactGate(sampleRate)
+        ? new LeadingPcmArtifactGate(sampleRate, gateProfile!.maxPrefixMs)
         : null;
       const result = new Promise<SynthesizedAudio>((resolve, reject) => {
         resolveResult = resolve;
@@ -579,7 +666,13 @@ export class TtsService implements OnModuleDestroy {
         clearTimeout(idleTimeout);
         if (leadingArtifactGate && leadingArtifactGate.trimmedBytes > 0) {
           this.logger.warn(
-            `Removed leading realtime TTS artifact task=${taskId} bytes=${leadingArtifactGate.trimmedBytes} durationMs=${Math.round((leadingArtifactGate.trimmedBytes * 1000) / (sampleRate * 2))}`,
+            `Removed leading realtime TTS artifact task=${taskId} voice=${voice} gate=${gateProfile!.mode} prefixMs=${leadingArtifactGate.maxPrefixMs} bytes=${leadingArtifactGate.trimmedBytes} durationMs=${Math.round((leadingArtifactGate.trimmedBytes * 1000) / (sampleRate * 2))}`,
+          );
+        }
+        if (leadingArtifactGate && receivedByteLength > 0) {
+          this.recordLeadingArtifactResult(
+            voice,
+            leadingArtifactGate.trimmedBytes > 0,
           );
         }
         resolveResult({
@@ -946,6 +1039,13 @@ export class TtsService implements OnModuleDestroy {
       .replace(/\s+/g, ' ')
       .replace(/\s*([，。！？、,.!?；;：:])\s*/g, '$1')
       .replace(/([，、；;：:])(?=[。！？.!?])/g, '')
+      // A streamed model may begin with a hesitation before producing the
+      // useful sentence. Keep the original assistant text for history, but
+      // do not spend first-audio latency synthesizing a drawn-out filler.
+      .replace(
+        /^(?:(?:嗯+|啊+|呃+|额+|唔+)[…·—~～，。！？、,.!?；;：:\s]*)+/,
+        '',
+      )
       .trim();
 
     return stripped;

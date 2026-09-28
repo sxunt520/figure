@@ -35,6 +35,7 @@ const RECORDING_IDLE_TIMEOUT_MS = 15_000;
 const CONNECTION_IDLE_TIMEOUT_MS = 10 * 60_000;
 const REPLY_TIMEOUT_MS = 120_000;
 const REALTIME_ASR_FINISH_GRACE_MS = 800;
+const DEVICE_AUTH_CACHE_MS = 5 * 60_000;
 
 function isDeviceVoiceUpgrade(request: IncomingMessage) {
   try {
@@ -131,6 +132,8 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
     let turnStartedAt: number | null = null;
     let firstAudioAt: number | null = null;
     let turnSerial = 0;
+    let authenticatedToken: string | null = null;
+    let authenticatedAt = 0;
 
     const emit = (event: Record<string, unknown>) => {
       if (socket.readyState === WebSocket.OPEN) {
@@ -300,13 +303,19 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
           if (isBinary) throw new Error('请先发送 audio.start');
           request = readStart(data, OpusDecoderClass !== null);
           turnStartedAt = Date.now();
-          const authenticatedDevice = await store.getDeviceForToken(
-            request.token,
-          );
+          const authCacheHit =
+            device !== null &&
+            authenticatedToken === request.token &&
+            Date.now() - authenticatedAt < DEVICE_AUTH_CACHE_MS;
+          const authenticatedDevice = authCacheHit
+            ? device
+            : await store.getDeviceForToken(request.token);
           if (!authenticatedDevice) {
             throw new Error('设备登录状态无效，请重新创建会话');
           }
           device = authenticatedDevice;
+          authenticatedToken = request.token;
+          authenticatedAt = Date.now();
           turnSerial += 1;
           chunks = [];
           receivedPcmBytes = 0;
@@ -380,7 +389,7 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
             asrMode: 'realtime_starting',
           });
           logger.log(
-            `Device voice stream ready device=${device.id} turn=${turnSerial} readyMs=${Date.now() - turnStartedAt}`,
+            `Device voice stream ready device=${device.id} turn=${turnSerial} readyMs=${Date.now() - turnStartedAt} authCache=${authCacheHit ? 'hit' : 'miss'}`,
           );
           return;
         }
@@ -512,6 +521,10 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
               : 'batch_fallback',
           firstPartialMs:
             'firstPartialMs' in result ? result.firstPartialMs : null,
+          finalizationElapsedMs:
+            'finalizationElapsedMs' in result
+              ? result.finalizationElapsedMs
+              : null,
         });
         voiceHub.publish({
           type: 'voice.transcript.final',
@@ -531,7 +544,7 @@ export function registerDeviceVoiceWebSocket(app: INestApplication) {
           hasText: Boolean(result.text),
         });
         logger.log(
-          `Device voice stream completed device=${activeDevice.id} turn=${activeTurnSerial} format=${request.format} wireBytes=${receivedWireBytes} pcmBytes=${receivedPcmBytes} ratio=${receivedWireBytes > 0 ? (receivedPcmBytes / receivedWireBytes).toFixed(2) : '1.00'} chars=${result.text.length} provider=${result.provider} speechToTranscriptMs=${Date.now() - speechEndedAt} firstPartialMs=${'firstPartialMs' in result ? result.firstPartialMs : 'n/a'}${realtimeFallbackReason ? ` fallback=${realtimeFallbackReason}` : ''}`,
+          `Device voice stream completed device=${activeDevice.id} turn=${activeTurnSerial} format=${request.format} wireBytes=${receivedWireBytes} pcmBytes=${receivedPcmBytes} ratio=${receivedWireBytes > 0 ? (receivedPcmBytes / receivedWireBytes).toFixed(2) : '1.00'} chars=${result.text.length} provider=${result.provider} speechToTranscriptMs=${Date.now() - speechEndedAt} firstPartialMs=${'firstPartialMs' in result ? result.firstPartialMs : 'n/a'} finalizationMs=${'finalizationElapsedMs' in result ? result.finalizationElapsedMs : 'n/a'}${realtimeFallbackReason ? ` fallback=${realtimeFallbackReason}` : ''}`,
         );
         if (!result.text && activeTurnSerial === turnSerial) {
           emit({ type: 'session.completed' });
